@@ -30,4 +30,8 @@ Make sure your Rust toolchain is current. Build and run with the release profile
 
 ### Performance Note
 
+    Top: Current FPS
+    Middle: Max FPS
+    Bottom: Min FPS
+
 Raymarching is exponentially expensive based on the complexity of the `map()` function. Cranking the cube count will eventually tank your framerate. If the green counter in the top-left drops, you're hitting the limit of your hardware's throughput.
