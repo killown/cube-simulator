@@ -33,6 +33,7 @@ struct ShaderUniforms {
     size: f32,
     speed: f32,
     _padding: f32,
+    fps_data: [f32; 4],
 }
 
 struct State<'a> {
@@ -48,6 +49,8 @@ struct State<'a> {
     last_fps_update: std::time::Instant,
     frame_count: u32,
     current_fps: f32,
+    min_fps: f32,
+    max_fps: f32,
     args: Args,
 }
 
@@ -55,7 +58,7 @@ impl<'a> State<'a> {
     async fn new(window: Arc<Window>, args: Args) -> State<'a> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::GL,
             ..Default::default()
         });
 
@@ -74,16 +77,25 @@ impl<'a> State<'a> {
             .unwrap();
         let caps = surface.get_capabilities(&adapter);
 
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+
         let uniforms = ShaderUniforms {
             color: [args.red, args.green, args.blue, 1.0],
             cube_count: args.cubes.min(128),
             size: args.size,
             speed: args.speed,
             _padding: 0.0,
+            fps_data: [0.0, 0.0, 0.0, 0.0],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
+            label: None,
             contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -117,7 +129,7 @@ impl<'a> State<'a> {
             format: caps.formats[0],
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -132,6 +144,8 @@ impl<'a> State<'a> {
                     cube_count: u32,
                     size: f32,
                     speed: f32,
+                    padding: f32,
+                    fps_data: vec4<f32>,
                 };
                 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -139,7 +153,6 @@ impl<'a> State<'a> {
                     @builtin(position) clip_position: vec4<f32>,
                     @location(0) uv: vec2<f32>,
                     @location(1) time: f32,
-                    @location(2) fps: f32,
                 };
 
                 @vertex
@@ -148,8 +161,7 @@ impl<'a> State<'a> {
                     let pos = array<vec2<f32>, 4>(vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0), vec2(1.0, 1.0));
                     out.clip_position = vec4<f32>(pos[v_idx], 0.0, 1.0);
                     out.uv = pos[v_idx];
-                    out.time = f32(i_idx & 0xFFFFu) * 0.001;
-                    out.fps = f32((i_idx >> 16u) & 0xFFFFu);
+                    out.time = f32(i_idx) * 0.001;
                     return out;
                 }
 
@@ -176,6 +188,12 @@ impl<'a> State<'a> {
                     if (segs & 4) != 0 && p.x < w && p.y < 0.5 { d = 1.0; }
                     if (segs & 2) != 0 && p.y > 0.5-w/2.0 && p.y < 0.5+w/2.0 { d = 1.0; }
                     return d;
+                }
+
+                fn draw_num(uv: vec2<f32>, val: i32) -> f32 {
+                    return max(sd_digit(uv, (val/100)%10), 
+                           max(sd_digit(uv-vec2(1.2,0.0), (val/10)%10), 
+                               sd_digit(uv-vec2(2.4,0.0), val%10)));
                 }
 
                 fn map(p: vec3<f32>, t: f32) -> f32 {
@@ -207,6 +225,7 @@ impl<'a> State<'a> {
                     let uv = in.uv * vec2(1.77, 1.0);
                     var ro = vec3(0.0, 0.0, 10.0);
                     var rd = normalize(vec3(uv, -1.8));
+
                     var total = 0.0; var hit = false; var p: vec3<f32>;
                     for(var i=0; i<80; i++) {
                         p = ro + rd * total;
@@ -214,19 +233,27 @@ impl<'a> State<'a> {
                         if d < 0.002 { hit = true; break; }
                         total += d; if total > 30.0 { break; }
                     }
+
                     var color: vec3<f32>;
                     let grain = hash(in.uv + fract(t));
                     if !hit {
                         color = mix(vec3(0.01, 0.02, 0.05), vec3(0.05, 0.08, 0.15), in.uv.y * 0.5 + 0.5) + grain * 0.04;
                     } else {
                         let eps = vec2(0.005, 0.0);
-                        let n = normalize(vec3(map(p+eps.xyy, t)-map(p-eps.xyy, t), map(p+eps.yxy, t)-map(p-eps.yxy, t), map(p+eps.yyx, t)-map(p-eps.yyx, t)));
+                        let n = normalize(vec3(
+                            map(p+eps.xyy, t)-map(p-eps.xyy, t), 
+                            map(p+eps.yxy, t)-map(p-eps.yxy, t), 
+                            map(p+eps.yyx, t)-map(p-eps.yyx, t)
+                        ));
                         let light = max(dot(n, normalize(vec3(1.0, 2.0, 1.0))), 0.2);
                         color = u.color.rgb * light + grain * 0.03;
                     }
-                    let f_uv = (in.uv - vec2(-0.88, 0.88)) * 12.0;
-                    let val = i32(in.fps);
-                    let d = max(sd_digit(f_uv, (val/100)%10), max(sd_digit(f_uv-vec2(1.2,0), (val/10)%10), sd_digit(f_uv-vec2(2.4,0), val%10)));
+
+                    let d_c = draw_num((in.uv - vec2(-0.88, 0.88)) * 12.0, i32(u.fps_data.x));
+                    let d_ma = draw_num((in.uv - vec2(-0.88, 0.76)) * 12.0, i32(u.fps_data.z));
+                    let d_mi = draw_num((in.uv - vec2(-0.88, 0.64)) * 12.0, i32(u.fps_data.y));
+                    let d = max(d_c, max(d_ma, d_mi));
+
                     return vec4(mix(color, vec3(0.0, 1.0, 0.0), d), 1.0);
                 }
             ")),
@@ -280,6 +307,8 @@ impl<'a> State<'a> {
             last_fps_update: std::time::Instant::now(),
             frame_count: 0,
             current_fps: 0.0,
+            min_fps: 0.0,
+            max_fps: 0.0,
             args,
         }
     }
@@ -292,8 +321,8 @@ impl<'a> State<'a> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let packed = (self.start_time.elapsed().as_millis() as u32 & 0xFFFF)
-            | ((self.current_fps as u32 & 0xFFFF) << 16);
+        let packed = self.start_time.elapsed().as_millis() as u32;
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -314,11 +343,31 @@ impl<'a> State<'a> {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
         self.frame_count += 1;
         let now = std::time::Instant::now();
         let diff = now.duration_since(self.last_fps_update);
         if diff.as_secs_f32() >= 0.5 {
             self.current_fps = self.frame_count as f32 / diff.as_secs_f32();
+
+            if self.min_fps == 0.0 || self.current_fps < self.min_fps {
+                self.min_fps = self.current_fps;
+            }
+            if self.current_fps > self.max_fps {
+                self.max_fps = self.current_fps;
+            }
+
+            let uniforms = ShaderUniforms {
+                color: [self.args.red, self.args.green, self.args.blue, 1.0],
+                cube_count: self.args.cubes.min(128),
+                size: self.args.size,
+                speed: self.args.speed,
+                _padding: 0.0,
+                fps_data: [self.current_fps, self.min_fps, self.max_fps, 0.0],
+            };
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
             self.frame_count = 0;
             self.last_fps_update = now;
         }
