@@ -8,7 +8,8 @@ This is a raymarching playground built with Rust and WGPU. Instead of the usual 
 
 Make sure your Rust toolchain is current. Build and run with the release profile for actual performance:
 
-    cargo run --release -- [ARGS]
+    cargo build --release
+    target/release/frame-test -- [ARGS]
 
 ### CLI Parameters
 
