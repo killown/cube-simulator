@@ -5,7 +5,7 @@ use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowAttributes},
+    window::{Fullscreen, Window, WindowAttributes},
 };
 
 #[derive(Parser, Debug, Clone, Copy)]
@@ -34,6 +34,7 @@ struct ShaderUniforms {
     speed: f32,
     _padding: f32,
     fps_data: [f32; 4],
+    adv_data: [f32; 4],
 }
 
 struct State<'a> {
@@ -47,7 +48,9 @@ struct State<'a> {
     uniform_bind_group: wgpu::BindGroup,
     start_time: std::time::Instant,
     last_fps_update: std::time::Instant,
+    last_frame_time: std::time::Instant,
     frame_count: u32,
+    frame_times: Vec<f32>,
     current_fps: f32,
     min_fps: f32,
     max_fps: f32,
@@ -58,7 +61,7 @@ impl<'a> State<'a> {
     async fn new(window: Arc<Window>, args: Args) -> State<'a> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
@@ -92,6 +95,7 @@ impl<'a> State<'a> {
             speed: args.speed,
             _padding: 0.0,
             fps_data: [0.0, 0.0, 0.0, 0.0],
+            adv_data: [0.0, 0.0, 0.0, 0.0],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -146,6 +150,7 @@ impl<'a> State<'a> {
                     speed: f32,
                     padding: f32,
                     fps_data: vec4<f32>,
+                    adv_data: vec4<f32>,
                 };
                 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -174,26 +179,33 @@ impl<'a> State<'a> {
                     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
                 }
 
-                fn sd_digit(uv: vec2<f32>, n: i32) -> f32 {
-                    let p = uv * vec2(1.0, -1.0) + vec2(0.5);
-                    if p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 { return 0.0; }
-                    let segs = array<i32, 10>(252, 96, 218, 242, 102, 182, 190, 224, 254, 246)[n];
-                    let w = 0.15;
-                    var d = 0.0;
-                    if (segs & 128) != 0 && p.y < w { d = 1.0; }
-                    if (segs & 64) != 0 && p.x > 1.0-w && p.y < 0.5 { d = 1.0; }
-                    if (segs & 32) != 0 && p.x > 1.0-w && p.y > 0.5 { d = 1.0; }
-                    if (segs & 16) != 0 && p.y > 1.0-w { d = 1.0; }
-                    if (segs & 8) != 0 && p.x < w && p.y > 0.5 { d = 1.0; }
-                    if (segs & 4) != 0 && p.x < w && p.y < 0.5 { d = 1.0; }
-                    if (segs & 2) != 0 && p.y > 0.5-w/2.0 && p.y < 0.5+w/2.0 { d = 1.0; }
-                    return d;
+                fn sd_char(uv: vec2<f32>, bits: i32) -> f32 {
+                    if (uv.x < 0.0 || uv.x >= 3.0 || uv.y < 0.0 || uv.y >= 5.0) { return 0.0; }
+                    let ix = i32(uv.x);
+                    let iy = i32(uv.y);
+                    let bit_idx = u32((4 - iy) * 3 + ix);
+                    if ((bits & (1 << bit_idx)) != 0) {
+                        let local_uv = fract(uv) - 0.5;
+                        let d = max(abs(local_uv.x), abs(local_uv.y)) - 0.4;
+                        if (d < 0.0) { return 1.0; }
+                    }
+                    return 0.0;
                 }
 
                 fn draw_num(uv: vec2<f32>, val: i32) -> f32 {
-                    return max(sd_digit(uv, (val/100)%10), 
-                           max(sd_digit(uv-vec2(1.2,0.0), (val/10)%10), 
-                               sd_digit(uv-vec2(2.4,0.0), val%10)));
+                    let digits = array<i32, 10>(31599, 9879, 31183, 31207, 23524, 29671, 29679, 30994, 31727, 31719);
+                    let h = (val / 100) % 10;
+                    let t = (val / 10) % 10;
+                    let u_val = val % 10;
+
+                    var d = sd_char(uv - vec2(8.0, 0.0), digits[u_val]);
+                    if (val >= 10) {
+                        d = max(d, sd_char(uv - vec2(4.0, 0.0), digits[t]));
+                    }
+                    if (val >= 100) {
+                        d = max(d, sd_char(uv, digits[h]));
+                    }
+                    return d;
                 }
 
                 fn map(p: vec3<f32>, t: f32) -> f32 {
@@ -249,12 +261,29 @@ impl<'a> State<'a> {
                         color = u.color.rgb * light + grain * 0.03;
                     }
 
-                    let d_c = draw_num((in.uv - vec2(-0.88, 0.88)) * 12.0, i32(u.fps_data.x));
-                    let d_ma = draw_num((in.uv - vec2(-0.88, 0.76)) * 12.0, i32(u.fps_data.z));
-                    let d_mi = draw_num((in.uv - vec2(-0.88, 0.64)) * 12.0, i32(u.fps_data.y));
-                    let d = max(d_c, max(d_ma, d_mi));
+                    let scale = 110.0;
+                    let base_uv = vec2((in.uv.x - (-0.98)) * scale, (0.98 - in.uv.y) * scale);
 
-                    return vec4(mix(color, vec3(0.0, 1.0, 0.0), d), 1.0);
+                    var d = max(sd_char(base_uv, 29385), max(sd_char(base_uv - vec2(4.0, 0.0), 31689), sd_char(base_uv - vec2(8.0, 0.0), 29671)));
+                    d = max(d, draw_num(base_uv - vec2(14.0, 0.0), i32(u.fps_data.x)));
+
+                    let r1 = base_uv - vec2(0.0, 6.0);
+                    d = max(d, max(sd_char(r1, 24429), max(sd_char(r1 - vec2(4.0, 0.0), 11245), sd_char(r1 - vec2(8.0, 0.0), 23213))));
+                    d = max(d, draw_num(r1 - vec2(14.0, 0.0), i32(u.fps_data.z)));
+
+                    let r2 = base_uv - vec2(0.0, 12.0);
+                    d = max(d, max(sd_char(r2, 24429), max(sd_char(r2 - vec2(4.0, 0.0), 29847), sd_char(r2 - vec2(8.0, 0.0), 23533))));
+                    d = max(d, draw_num(r2 - vec2(14.0, 0.0), i32(u.fps_data.y)));
+
+                    let r3 = base_uv - vec2(0.0, 18.0);
+                    d = max(d, max(sd_char(r3, 9879), max(sd_char(r3 - vec2(4.0, 0.0), 22669), sd_char(r3 - vec2(8.0, 0.0), 4687))));
+                    d = max(d, draw_num(r3 - vec2(14.0, 0.0), i32(u.fps_data.w)));
+
+                    let r4 = base_uv - vec2(0.0, 24.0);
+                    d = max(d, max(sd_char(r4, 31023), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
+                    d = max(d, draw_num(r4 - vec2(14.0, 0.0), i32(u.adv_data.x)));
+
+                    return vec4(mix(color, vec3(0.0, 1.0, 0.5), d), 1.0);
                 }
             ")),
         });
@@ -305,7 +334,9 @@ impl<'a> State<'a> {
             uniform_bind_group,
             start_time: std::time::Instant::now(),
             last_fps_update: std::time::Instant::now(),
+            last_frame_time: std::time::Instant::now(),
             frame_count: 0,
+            frame_times: Vec::with_capacity(120),
             current_fps: 0.0,
             min_fps: 0.0,
             max_fps: 0.0,
@@ -346,6 +377,10 @@ impl<'a> State<'a> {
 
         self.frame_count += 1;
         let now = std::time::Instant::now();
+        let frame_delta = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
+        self.frame_times.push(frame_delta);
+        self.last_frame_time = now;
+
         let diff = now.duration_since(self.last_fps_update);
         if diff.as_secs_f32() >= 0.5 {
             self.current_fps = self.frame_count as f32 / diff.as_secs_f32();
@@ -357,17 +392,40 @@ impl<'a> State<'a> {
                 self.max_fps = self.current_fps;
             }
 
+            let mut jitter_sum = 0.0;
+            for i in 1..self.frame_times.len() {
+                jitter_sum += (self.frame_times[i] - self.frame_times[i - 1]).abs();
+            }
+            let jitter = if self.frame_times.len() > 1 {
+                jitter_sum / (self.frame_times.len() - 1) as f32
+            } else {
+                0.0
+            };
+
+            self.frame_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let one_percent_index = (self.frame_times.len() as f32 * 0.01).ceil() as usize;
+            let one_percent_index = one_percent_index.max(1).min(self.frame_times.len());
+            let avg_1pct_time: f32 = self.frame_times[..one_percent_index].iter().sum::<f32>()
+                / one_percent_index as f32;
+            let low_1_fps = if avg_1pct_time > 0.0 {
+                1000.0 / avg_1pct_time
+            } else {
+                0.0
+            };
+
             let uniforms = ShaderUniforms {
                 color: [self.args.red, self.args.green, self.args.blue, 1.0],
                 cube_count: self.args.cubes.min(128),
                 size: self.args.size,
                 speed: self.args.speed,
                 _padding: 0.0,
-                fps_data: [self.current_fps, self.min_fps, self.max_fps, 0.0],
+                fps_data: [self.current_fps, self.min_fps, self.max_fps, low_1_fps],
+                adv_data: [jitter, 0.0, 0.0, 0.0],
             };
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
+            self.frame_times.clear();
             self.frame_count = 0;
             self.last_fps_update = now;
         }
@@ -382,9 +440,12 @@ struct App<'a> {
 
 impl<'a> ApplicationHandler for App<'a> {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
+        let attributes =
+            WindowAttributes::default().with_fullscreen(Some(Fullscreen::Borderless(None)));
+        let window = Arc::new(el.create_window(attributes).unwrap());
         self.state = Some(pollster::block_on(State::new(window, self.args)));
     }
+
     fn window_event(
         &mut self,
         el: &ActiveEventLoop,
@@ -394,6 +455,16 @@ impl<'a> ApplicationHandler for App<'a> {
         if let Some(state) = self.state.as_mut() {
             match event {
                 WindowEvent::CloseRequested => el.exit(),
+                WindowEvent::KeyboardInput {
+                    event:
+                        winit::event::KeyEvent {
+                            logical_key:
+                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+                            state: winit::event::ElementState::Pressed,
+                            ..
+                        },
+                    ..
+                } => el.exit(),
                 WindowEvent::Resized(s) => {
                     state.config.width = s.width.max(1);
                     state.config.height = s.height.max(1);
