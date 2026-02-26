@@ -4,6 +4,12 @@ This is a raymarching playground built with Rust and WGPU. Instead of the usual 
 
 ---
 
+
+
+https://github.com/user-attachments/assets/f839f53b-9e11-4ce6-a3b9-cc3d5adc6076
+
+
+
 ### Installation and Usage
 
 Make sure your Rust toolchain is current. Build and run with the release profile for actual performance:
