@@ -1,37 +1,41 @@
-# WGPU Cube Simulator
+WGPU Cube Simulator
+===================
 
-This is a raymarching playground built with Rust and WGPU. Instead of the usual triangle-based rasterization, this project uses fragment shaders to calculate signed distance fields (SDFs) in real-time. It's built for performance testing and seeing how hard we can push a GPU with purely mathematical geometry.
+This project is a high-precision diagnostic tool built with **Rust** and **WGPU** to measure **JIT (Just-In-Time) presentation latency** and frame pacing stability under heavy load. By utilizing a raymarched fragment shader rather than standard rasterization, it allows for granular control over GPU throughput to identify compositor bottlenecks and V-Sync implementation flaws.
 
----
+* * *
 
+> [!IMPORTANT]
+> **Priority One:** For effective diagnostic testing, the workload should be increased (using the `--cubes` argument) until the **FPS drops below 60**.
+>
+> Saturating the GPU to this level is the only way to reliably expose frame pacing issues, as it removes any "buffer cushion" and forces the compositor's synchronization flaws to manifest as visible stutter or JIT spikes.
 
-
-https://github.com/user-attachments/assets/f839f53b-9e11-4ce6-a3b9-cc3d5adc6076
-
-
+* **JIT Detection:** Identifies the delta between application-side render submission and hardware-side presentation.
+* **Compositor Benchmarking:** Highlights the architectural gap between modern compositors.
+* **V-Sync Profiling:** Specifically targets the detection of "Back-Pressure" in the swapchain, where missed V-Blank intervals at high refresh rates cause cascading latency spikes.
 
 ### Installation and Usage
 
-Make sure your Rust toolchain is current. Build and run with the release profile for actual performance:
+To get accurate JIT metrics, you must compile with the release profile to minimize CPU-side scheduling interference and driver overhead:
 
     cargo build --release
-    target/release/frame-test -- [ARGS]
+    ./target/release/frame-test -c 120
 
 ### CLI Parameters
 
-| Argument                 | Description                              | Default       |
-| :----------------------- | :--------------------------------------- | :------------ |
-| `-c, --cubes`            | Number of hollow cubes to march.         | 6             |
-| `-s, --size`             | Radius/Scale of the objects.             | 0.5           |
-| `--speed`                | Multiplier for rotation and oscillation. | 1.0           |
-| `--red, --green, --blue` | RGB float components (0.0 to 1.0).       | 0.5, 0.8, 0.2 |
+| Argument | Description | Default |
+| :--- | :--- | :--- |
+| `-c, --cubes` | Number of hollow cubes to march. | 120 |
+| `-s, --size` | Radius/Scale of the objects. | 0.5 |
+| `--speed` | Multiplier for rotation and oscillation. | 1.0 |
+| `--red, --green, --blue` | RGB float components (0.0 to 1.0). | 0.5, 0.8, 0.2 |
 
----
+***
 
-### Performance Note
+### Technical Metrics
 
-    Top: Current FPS
-    Middle: Max FPS
-    Bottom: Min FPS
+The on-screen display provides real-time telemetry used to detect jitter
 
-Raymarching is exponentially expensive based on the complexity of the `map()` function. Cranking the cube count will eventually tank your framerate. If the green counter in the top-left drops, you're hitting the limit of your hardware's throughput.
+### Performance Note: Why Raymarching?
+
+Unlike triangle-based engines, raymarching is exponentially expensive based on the complexity of the `map()` function. Every pixel executes a distance field loop for every cube added. This creates a **purely GPU-bound** environment, which is the only way to accurately test if a compositor's V-Sync implementation can handle high-throughput scenarios without introducing artificial input lag or flickering.
