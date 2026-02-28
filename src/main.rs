@@ -50,6 +50,7 @@ struct State<'a> {
     last_fps_update: std::time::Instant,
     last_frame_time: std::time::Instant,
     frame_count: u32,
+    dropped_frames: u32,
     frame_times: Vec<f32>,
     current_fps: f32,
     min_fps: f32,
@@ -283,6 +284,11 @@ impl<'a> State<'a> {
                     d = max(d, max(sd_char(r4, 31023), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
                     d = max(d, draw_num(r4 - vec2(14.0, 0.0), i32(u.adv_data.x)));
 
+                    let r5 = base_uv - vec2(0.0, 30.0);
+                    let char_m = 24429; let char_s = 29671; let char_d = 27503;
+                    d = max(d, max(sd_char(r5, char_m), max(sd_char(r5 - vec2(4.0, 0.0), char_s), sd_char(r5 - vec2(8.0, 0.0), char_d))));
+                    d = max(d, draw_num(r5 - vec2(14.0, 0.0), i32(u.adv_data.y)));
+
                     return vec4(mix(color, vec3(0.0, 1.0, 0.5), d), 1.0);
                 }
             ")),
@@ -336,6 +342,7 @@ impl<'a> State<'a> {
             last_fps_update: std::time::Instant::now(),
             last_frame_time: std::time::Instant::now(),
             frame_count: 0,
+            dropped_frames: 0,
             frame_times: Vec::with_capacity(120),
             current_fps: 0.0,
             min_fps: 0.0,
@@ -383,13 +390,17 @@ impl<'a> State<'a> {
         self.frame_count += 1;
         let now = std::time::Instant::now();
         let total_frame_delta = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
+
+        if total_frame_delta > 25.0 {
+            self.dropped_frames += (total_frame_delta / 16.66).floor() as u32;
+        }
+
         self.frame_times.push(total_frame_delta);
         self.last_frame_time = now;
 
         let diff = now.duration_since(self.last_fps_update);
         if diff.as_secs_f32() >= 0.5 {
             self.current_fps = self.frame_count as f32 / diff.as_secs_f32();
-
             if self.min_fps == 0.0 || self.current_fps < self.min_fps {
                 self.min_fps = self.current_fps;
             }
@@ -410,8 +421,9 @@ impl<'a> State<'a> {
 
             // Calculate 1% Lows
             self.frame_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            let one_percent_index = (self.frame_times.len() as f32 * 0.01).ceil() as usize;
-            let one_percent_index = one_percent_index.max(1).min(self.frame_times.len());
+            let one_percent_index = ((self.frame_times.len() as f32 * 0.01).ceil() as usize)
+                .max(1)
+                .min(self.frame_times.len());
             let avg_1pct_time: f32 = self.frame_times[..one_percent_index].iter().sum::<f32>()
                 / one_percent_index as f32;
             let low_1_fps = if avg_1pct_time > 0.0 {
@@ -427,13 +439,14 @@ impl<'a> State<'a> {
                 speed: self.args.speed,
                 _padding: 0.0,
                 fps_data: [self.current_fps, self.min_fps, self.max_fps, low_1_fps],
-                adv_data: [jitter, acquire_time, 0.0, 0.0],
+                adv_data: [jitter, self.dropped_frames as f32, acquire_time, 0.0],
             };
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
             self.frame_times.clear();
             self.frame_count = 0;
+            self.dropped_frames = 0;
             self.last_fps_update = now;
         }
         Ok(())
