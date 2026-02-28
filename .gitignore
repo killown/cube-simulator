@@ -1,0 +1,23 @@
+# --- Build Artifacts ---
+target/
+**/*.rs.bk
+
+# --- IDEs and Editors ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- OS Metadata ---
+.DS_Store
+Thumbs.db
+
+# --- Development Overrides ---
+# Useful if you create a local shell script to test different --cubes args
+test_run.sh
+.env
+
+# --- Dependency Locks ---
+# For binaries, you typically DO commit Cargo.lock.
+# If this was a library, you'd add it here.
+# Cargo.lock
