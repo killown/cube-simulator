@@ -345,7 +345,12 @@ impl<'a> State<'a> {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let frame_start = std::time::Instant::now();
+
+        // Measure JIT/Back-pressure: How long does the swapchain block us?
         let output = self.surface.get_current_texture()?;
+        let acquire_time = frame_start.elapsed().as_secs_f32() * 1000.0;
+
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -377,8 +382,8 @@ impl<'a> State<'a> {
 
         self.frame_count += 1;
         let now = std::time::Instant::now();
-        let frame_delta = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
-        self.frame_times.push(frame_delta);
+        let total_frame_delta = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
+        self.frame_times.push(total_frame_delta);
         self.last_frame_time = now;
 
         let diff = now.duration_since(self.last_fps_update);
@@ -392,6 +397,7 @@ impl<'a> State<'a> {
                 self.max_fps = self.current_fps;
             }
 
+            // Calculate Jitter (Frame Time Variance)
             let mut jitter_sum = 0.0;
             for i in 1..self.frame_times.len() {
                 jitter_sum += (self.frame_times[i] - self.frame_times[i - 1]).abs();
@@ -402,6 +408,7 @@ impl<'a> State<'a> {
                 0.0
             };
 
+            // Calculate 1% Lows
             self.frame_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
             let one_percent_index = (self.frame_times.len() as f32 * 0.01).ceil() as usize;
             let one_percent_index = one_percent_index.max(1).min(self.frame_times.len());
@@ -420,7 +427,7 @@ impl<'a> State<'a> {
                 speed: self.args.speed,
                 _padding: 0.0,
                 fps_data: [self.current_fps, self.min_fps, self.max_fps, low_1_fps],
-                adv_data: [jitter, 0.0, 0.0, 0.0],
+                adv_data: [jitter, acquire_time, 0.0, 0.0],
             };
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
