@@ -23,6 +23,8 @@ struct Args {
     green: f32,
     #[arg(long, default_value_t = 0.2)]
     blue: f32,
+    #[arg(short = 't', long, default_value_t = 25.0)]
+    threshold: f32,
 }
 
 #[repr(C)]
@@ -265,29 +267,41 @@ impl<'a> State<'a> {
                     let scale = 110.0;
                     let base_uv = vec2((in.uv.x - (-0.98)) * scale, (0.98 - in.uv.y) * scale);
 
+                    // Row 0: FPS
                     var d = max(sd_char(base_uv, 29385), max(sd_char(base_uv - vec2(4.0, 0.0), 31689), sd_char(base_uv - vec2(8.0, 0.0), 29671)));
                     d = max(d, draw_num(base_uv - vec2(14.0, 0.0), i32(u.fps_data.x)));
 
+                    // Row 1: MIN
                     let r1 = base_uv - vec2(0.0, 6.0);
                     d = max(d, max(sd_char(r1, 24429), max(sd_char(r1 - vec2(4.0, 0.0), 11245), sd_char(r1 - vec2(8.0, 0.0), 23213))));
                     d = max(d, draw_num(r1 - vec2(14.0, 0.0), i32(u.fps_data.z)));
 
+                    // Row 2: MAX
                     let r2 = base_uv - vec2(0.0, 12.0);
                     d = max(d, max(sd_char(r2, 24429), max(sd_char(r2 - vec2(4.0, 0.0), 29847), sd_char(r2 - vec2(8.0, 0.0), 23533))));
                     d = max(d, draw_num(r2 - vec2(14.0, 0.0), i32(u.fps_data.y)));
 
+                    // Row 3: LOW
                     let r3 = base_uv - vec2(0.0, 18.0);
                     d = max(d, max(sd_char(r3, 9879), max(sd_char(r3 - vec2(4.0, 0.0), 22669), sd_char(r3 - vec2(8.0, 0.0), 4687))));
                     d = max(d, draw_num(r3 - vec2(14.0, 0.0), i32(u.fps_data.w)));
 
+                    // Row 4: JIT
                     let r4 = base_uv - vec2(0.0, 24.0);
                     d = max(d, max(sd_char(r4, 31023), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
                     d = max(d, draw_num(r4 - vec2(14.0, 0.0), i32(u.adv_data.x)));
 
+                    // Row 5: MSD
                     let r5 = base_uv - vec2(0.0, 30.0);
                     let char_m = 24429; let char_s = 29671; let char_d = 27503;
                     d = max(d, max(sd_char(r5, char_m), max(sd_char(r5 - vec2(4.0, 0.0), char_s), sd_char(r5 - vec2(8.0, 0.0), char_d))));
                     d = max(d, draw_num(r5 - vec2(14.0, 0.0), i32(u.adv_data.y)));
+
+                    // Row 6: ACQ
+                    let r6 = base_uv - vec2(0.0, 36.0);
+                    let char_a = 31725; let char_c = 29263; let char_q = 31612;
+                    d = max(d, max(sd_char(r6, char_a), max(sd_char(r6 - vec2(4.0, 0.0), char_c), sd_char(r6 - vec2(8.0, 0.0), char_q))));
+                    d = max(d, draw_num(r6 - vec2(14.0, 0.0), i32(u.adv_data.z)));
 
                     return vec4(mix(color, vec3(0.0, 1.0, 0.5), d), 1.0);
                 }
@@ -385,6 +399,7 @@ impl<'a> State<'a> {
             rpass.draw(0..4, packed..(packed + 1));
         }
         self.queue.submit(std::iter::once(encoder.finish()));
+
         output.present();
 
         self.frame_count += 1;
@@ -393,7 +408,7 @@ impl<'a> State<'a> {
 
         //FIXME: To get true, microsecond-accurate frame pacing, we need hardware-level presentation timestamps
         // https://docs.rs/wgpu/latest/wgpu/struct.PresentationTimestamp.html
-        if total_frame_delta > 25.0 {
+        if total_frame_delta > self.args.threshold {
             self.dropped_frames += (total_frame_delta / 16.66).floor() as u32;
         }
 
@@ -466,6 +481,19 @@ impl<'a> ApplicationHandler for App<'a> {
             WindowAttributes::default().with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = Arc::new(el.create_window(attributes).unwrap());
         self.state = Some(pollster::block_on(State::new(window, self.args)));
+
+        println!(
+            "\nMETRIC LEGEND:\n\
+            ==============\n\
+            FPS:  Average Frames Per Second\n\
+            MIN:  Minimum FPS observed\n\
+            MAX:  Maximum FPS observed\n\
+            LOW:  1% Low FPS (stutter indicator)\n\
+            JIT:  Frame-to-frame variance (ms)\n\
+            MSD:  Missed frames (>{:.1}ms threshold)\n\
+            ACQ:  Compositor swapchain latency (ms)\n",
+            self.args.threshold
+        );
     }
 
     fn window_event(

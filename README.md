@@ -31,9 +31,32 @@ To get accurate JIT metrics, you must compile with the release profile to minimi
 
 ---
 
-### Technical Metrics
+# WGPU Cube Simulator: Telemetry Metrics
 
-The on-screen display provides real-time telemetry used to detect jitter
+## General Performance Throughput
+
+- **FPS (Frames Per Second)**
+  The rolling average of frames rendered over the last 500ms update window. This represents the baseline rendering throughput of the GPU and the application loop.
+
+- **MIN (Minimum FPS)**
+  The absolute lowest 500ms rolling average recorded since the application started. This highlights sustained worst-case performance under maximum load.
+
+- **MAX (Maximum FPS)**
+  The absolute highest 500ms rolling average recorded. This represents peak hardware capability when the raymarching shader is under minimal load (e.g., few overlapping cubes in the view frustum).
+
+- **LOW (1% Low FPS)**
+  The average frame rate calculated exclusively from the slowest 1% of frame times within the 500ms window. This is the primary indicator of subjective smoothness. A high average FPS combined with a poor 1% Low indicates isolated, severe frame drops that the user will perceive as stutter.
+
+## Advanced Pacing & Stability
+
+- **JIT (Jitter)**
+  The average variance (in milliseconds) between consecutive frame times. Calculated mathematically as the average of `abs(frame_time[i] - frame_time[i-1])`. High jitter indicates inconsistent frame pacing. Even if the application averages a perfect 60 FPS (16.6ms), alternating between 10ms and 23ms frames will produce a visually unpleasant, "micro-stuttering" experience.
+
+- **MSD (Missed Frames)**
+  A cumulative counter of macro-stutters and severe application stalls. A frame is only evaluated here if its duration exceeds the configurable threshold (default: `25.0ms`). When a stall occurs, the total lost time is divided by the universal VSync interval (`16.66ms`) to calculate the discrete number of dropped presentation beats. This explicitly isolates true hardware/engine hitches from standard compositor noise.
+
+- **ACQ (Acquire Time)**
+  The duration (in milliseconds) the application thread is blocked waiting for `surface.get_current_texture()`. This metric maps directly to presentation back-pressure from the display server or Wayland compositor. If the compositor's buffers are saturated, or it is intentionally throttling the application to maintain desktop stability, `ACQ` will spike. This proves the bottleneck exists in the OS presentation layer, not the application's internal GPU work submission.
 
 ### Performance Note: Why Raymarching?
 
