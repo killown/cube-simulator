@@ -22,16 +22,17 @@ To get accurate JIT metrics, you must compile with the release profile to minimi
 
 ### CLI Parameters
 
-| Argument          | Description                                                                                       | Default |
-| :---------------- | :------------------------------------------------------------------------------------------------ | :------ |
-| `-c, --cubes`     | Number of hollow cubes to march.                                                                  | 120     |
-| `-s, --size`      | Radius/Scale of the objects.                                                                      | 0.5     |
-| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames).                                              | 25.0    |
-| `-f, --format`    | Force a specific `wgpu::TextureFormat` (e.g., `Rgba8Unorm`). Prints available options if invalid. | None    |
-| `--speed`         | Multiplier for rotation and oscillation.                                                          | 1.0     |
-| `--red`           | Red color component (0.0 to 1.0).                                                                 | 0.5     |
-| `--green`         | Green color component (0.0 to 1.0).                                                               | 0.8     |
-| `--blue`          | Blue color component (0.0 to 1.0).                                                                | 0.2     |
+| Argument          | Description                                                                                       | Default          |
+| :---------------- | :------------------------------------------------------------------------------------------------ | :--------------- |
+| `-c, --cubes`     | Number of hollow cubes to march.                                                                  | 120              |
+| `-s, --size`      | Radius/Scale of the objects.                                                                      | 0.5              |
+| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames).                                              | 25.0             |
+| `-f, --format`    | Force a specific `wgpu::TextureFormat` (e.g., `Rgba8Unorm`). Prints available options if invalid. | None             |
+| `-m, --mode`      | Force a specific `wgpu::PresentMode` (`mailbox`, `immediate`, `fifo`).                            | `mailbox` (auto) |
+| `--speed`         | Multiplier for rotation and oscillation.                                                          | 1.0              |
+| `--red`           | Red color component (0.0 to 1.0).                                                                 | 0.5              |
+| `--green`         | Green color component (0.0 to 1.0).                                                               | 0.8              |
+| `--blue`          | Blue color component (0.0 to 1.0).                                                                | 0.2              |
 
 ### Present Mode Diagnostics
 

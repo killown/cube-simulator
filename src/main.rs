@@ -27,6 +27,8 @@ struct Args {
     threshold: f32,
     #[arg(short = 'f', long)]
     format: Option<String>,
+    #[arg(short = 'm', long)]
+    mode: Option<String>,
 }
 
 #[repr(C)]
@@ -113,7 +115,32 @@ impl<'a> State<'a> {
                 .unwrap_or(caps.formats[0])
         };
 
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let present_mode = if let Some(ref requested_mode) = args.mode {
+            let requested = requested_mode.to_lowercase();
+            let mut selected = None;
+            if requested == "mailbox" {
+                selected = Some(wgpu::PresentMode::Mailbox);
+            } else if requested == "immediate" {
+                selected = Some(wgpu::PresentMode::Immediate);
+            } else if requested == "fifo" {
+                selected = Some(wgpu::PresentMode::Fifo);
+            }
+
+            match selected {
+                Some(m) if caps.present_modes.contains(&m) => m,
+                _ => {
+                    println!(
+                        "Error: Invalid or unsupported present mode '{}'",
+                        requested_mode
+                    );
+                    println!("Available present modes for this surface:");
+                    for m in &caps.present_modes {
+                        println!("  {:?}", m);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
