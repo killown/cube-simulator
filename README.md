@@ -22,12 +22,51 @@ To get accurate JIT metrics, you must compile with the release profile to minimi
 
 ### CLI Parameters
 
-| Argument                 | Description                              | Default       |
-| :----------------------- | :--------------------------------------- | :------------ |
-| `-c, --cubes`            | Number of hollow cubes to march.         | 120           |
-| `-s, --size`             | Radius/Scale of the objects.             | 0.5           |
-| `--speed`                | Multiplier for rotation and oscillation. | 1.0           |
-| `--red, --green, --blue` | RGB float components (0.0 to 1.0).       | 0.5, 0.8, 0.2 |
+| Argument          | Description                                          | Default |
+| ----------------- | ---------------------------------------------------- | ------- |
+| `-c, --cubes`     | Number of hollow cubes to march.                     | 120     |
+| `-s, --size`      | Radius/Scale of the objects.                         | 0.5     |
+| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames). | 25.0    |
+| `--speed`         | Multiplier for rotation and oscillation.             | 1.0     |
+| `--red`           | Red color component (0.0 to 1.0).                    | 0.5     |
+| `--green`         | Green color component (0.0 to 1.0).                  | 0.8     |
+| `--blue`          | Blue color component (0.0 to 1.0).                   | 0.2     |
+
+---
+
+### Quick Usage Examples
+
+#### Stress Test (120 Cubes, 10ms Target)
+
+Runs the simulation with 120 cubes and flags any frame taking longer than 10ms as a "Missed Frame" (MSD).
+
+```
+target/release/frame-test -c 120 -t 10
+```
+
+#### Custom Color Profile (Purple)
+
+Sets the RGB components manually to create a specific color output.
+
+```
+target/release/frame-test --red 0.6 --green 0.1 --blue 0.9
+```
+
+#### Visual Inspection (Slow & Large)
+
+Increases cube size and slows down the rotation speed to inspect the raymarching edge detection.
+
+```
+target/release/frame-test --size 1.2 --speed 0.2
+```
+
+#### Full Reset
+
+Runs the simulator with all compiled default values.
+
+```
+target/release/frame-test
+```
 
 ---
 
