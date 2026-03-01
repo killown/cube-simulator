@@ -56,6 +56,7 @@ struct State<'a> {
     min_fps: f32,
     max_fps: f32,
     args: Args,
+    target_frame_time: f32,
 }
 
 impl<'a> State<'a> {
@@ -88,6 +89,14 @@ impl<'a> State<'a> {
         } else {
             wgpu::PresentMode::Fifo
         };
+
+        let refresh_rate = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| mhz as f32 / 1000.0)
+            .unwrap_or(60.0);
+
+        let target_frame_time = 1000.0 / refresh_rate;
 
         let uniforms = ShaderUniforms {
             color: [args.red, args.green, args.blue, 1.0],
@@ -348,6 +357,7 @@ impl<'a> State<'a> {
             min_fps: 0.0,
             max_fps: 0.0,
             args,
+            target_frame_time,
         }
     }
 
@@ -391,8 +401,11 @@ impl<'a> State<'a> {
         let now = std::time::Instant::now();
         let total_frame_delta = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
 
-        if total_frame_delta > 25.0 {
-            self.dropped_frames += (total_frame_delta / 16.66).floor() as u32;
+        let intervals = (total_frame_delta / self.target_frame_time).round() as u32;
+        if intervals > 1 {
+            //FIXME: To get true, microsecond-accurate frame pacing, we need hardware-level presentation timestamps
+            // https://docs.rs/wgpu/latest/wgpu/struct.PresentationTimestamp.html
+            self.dropped_frames += intervals - 1;
         }
 
         self.frame_times.push(total_frame_delta);
