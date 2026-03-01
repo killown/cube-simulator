@@ -1,24 +1,17 @@
-WGPU Cube Simulator
-===================
+# WGPU Cube Simulator
 
 This project is a high-precision diagnostic tool built with **Rust** and **WGPU** to measure **JIT (Just-In-Time) presentation latency** and frame pacing stability under heavy load. By utilizing a raymarched fragment shader rather than standard rasterization, it allows for granular control over GPU throughput to identify compositor bottlenecks and V-Sync implementation flaws.
 
-* * *
+---
 
 > [!IMPORTANT]
 > **Priority One:** For effective diagnostic testing, the workload should be increased (using the `--cubes` argument) until the **FPS drops below 60**.
 >
 > Saturating the GPU to this level is the only way to reliably expose frame pacing issues, as it removes any "buffer cushion" and forces the compositor's synchronization flaws to manifest as visible stutter or JIT spikes.
-> 
->Note on Nested Compositors: This tool uses high-precision CPU timers to measure intervals between frame presentations.
-> 
-> When running inside a nested compositor (e.g., Gamescope), reported "dropped frames" may reflect compositor scheduling jitter rather than actual rendering failures.
-> 
-> For accurate performance profiling, run the application directly on a primary display server.
 
-* **JIT Detection:** Identifies the delta between application-side render submission and hardware-side presentation.
-* **Compositor Benchmarking:** Highlights the architectural gap between modern compositors.
-* **V-Sync Profiling:** Specifically targets the detection of "Back-Pressure" in the swapchain, where missed V-Blank intervals at high refresh rates cause cascading latency spikes.
+- **JIT Detection:** Identifies the delta between application-side render submission and hardware-side presentation.
+- **Compositor Benchmarking:** Highlights the architectural gap between modern compositors.
+- **V-Sync Profiling:** Specifically targets the detection of "Back-Pressure" in the swapchain, where missed V-Blank intervals at high refresh rates cause cascading latency spikes.
 
 ### Installation and Usage
 
@@ -29,14 +22,14 @@ To get accurate JIT metrics, you must compile with the release profile to minimi
 
 ### CLI Parameters
 
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| `-c, --cubes` | Number of hollow cubes to march. | 120 |
-| `-s, --size` | Radius/Scale of the objects. | 0.5 |
-| `--speed` | Multiplier for rotation and oscillation. | 1.0 |
-| `--red, --green, --blue` | RGB float components (0.0 to 1.0). | 0.5, 0.8, 0.2 |
+| Argument                 | Description                              | Default       |
+| :----------------------- | :--------------------------------------- | :------------ |
+| `-c, --cubes`            | Number of hollow cubes to march.         | 120           |
+| `-s, --size`             | Radius/Scale of the objects.             | 0.5           |
+| `--speed`                | Multiplier for rotation and oscillation. | 1.0           |
+| `--red, --green, --blue` | RGB float components (0.0 to 1.0).       | 0.5, 0.8, 0.2 |
 
-***
+---
 
 ### Technical Metrics
 
