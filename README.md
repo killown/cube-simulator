@@ -22,15 +22,24 @@ To get accurate JIT metrics, you must compile with the release profile to minimi
 
 ### CLI Parameters
 
-| Argument          | Description                                          | Default |
-| ----------------- | ---------------------------------------------------- | ------- |
-| `-c, --cubes`     | Number of hollow cubes to march.                     | 120     |
-| `-s, --size`      | Radius/Scale of the objects.                         | 0.5     |
-| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames). | 25.0    |
-| `--speed`         | Multiplier for rotation and oscillation.             | 1.0     |
-| `--red`           | Red color component (0.0 to 1.0).                    | 0.5     |
-| `--green`         | Green color component (0.0 to 1.0).                  | 0.8     |
-| `--blue`          | Blue color component (0.0 to 1.0).                   | 0.2     |
+| Argument          | Description                                                                                       | Default |
+| :---------------- | :------------------------------------------------------------------------------------------------ | :------ |
+| `-c, --cubes`     | Number of hollow cubes to march.                                                                  | 120     |
+| `-s, --size`      | Radius/Scale of the objects.                                                                      | 0.5     |
+| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames).                                              | 25.0    |
+| `-f, --format`    | Force a specific `wgpu::TextureFormat` (e.g., `Rgba8Unorm`). Prints available options if invalid. | None    |
+| `--speed`         | Multiplier for rotation and oscillation.                                                          | 1.0     |
+| `--red`           | Red color component (0.0 to 1.0).                                                                 | 0.5     |
+| `--green`         | Green color component (0.0 to 1.0).                                                               | 0.8     |
+| `--blue`          | Blue color component (0.0 to 1.0).                                                                | 0.2     |
+
+### Present Mode Diagnostics
+
+The simulator automatically selects the best available present mode (Mailbox > Immediate > Fifo) and prints the selection to the terminal with the following behavior:
+
+- **Fifo (Standard VSync):** Standard VSync logic. Blocks the CPU to match the monitor's refresh rate. **Note:** In this mode, ACQ (Acquire) metrics will stay at 0.0ms as the driver handles synchronization internally, masking acquisition handshake time.
+- **Mailbox (Triple Buffering):** A non-blocking mode that replaces the oldest frame in the queue. Ideal for measuring compositor release latency (ACQ).
+- **Immediate (Uncapped):** Renders as fast as possible without sync, providing the rawest performance data but potentially causing screen tearing.
 
 ---
 
