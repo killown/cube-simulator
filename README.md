@@ -9,6 +9,12 @@ This project is a high-precision diagnostic tool built with **Rust** and **WGPU*
 > **Priority One:** For effective diagnostic testing, the workload should be increased (using the `--cubes` argument) until the **FPS drops below 60**.
 >
 > Saturating the GPU to this level is the only way to reliably expose frame pacing issues, as it removes any "buffer cushion" and forces the compositor's synchronization flaws to manifest as visible stutter or JIT spikes.
+> 
+>Note on Nested Compositors: This tool uses high-precision CPU timers to measure intervals between frame presentations.
+> 
+> When running inside a nested compositor (e.g., Gamescope), reported "dropped frames" may reflect compositor scheduling jitter rather than actual rendering failures.
+> 
+> For accurate performance profiling, run the application directly on a primary display server.
 
 * **JIT Detection:** Identifies the delta between application-side render submission and hardware-side presentation.
 * **Compositor Benchmarking:** Highlights the architectural gap between modern compositors.
