@@ -8,7 +8,7 @@ use winit::{
     window::{Fullscreen, Window, WindowAttributes},
 };
 
-#[derive(Parser, Debug, Clone, Copy)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "WGPU Cube Simulator")]
 struct Args {
     #[arg(short, long, default_value_t = 6)]
@@ -25,6 +25,8 @@ struct Args {
     blue: f32,
     #[arg(short = 't', long, default_value_t = 25.0)]
     threshold: f32,
+    #[arg(short = 'f', long)]
+    format: Option<String>,
 }
 
 #[repr(C)]
@@ -83,6 +85,34 @@ impl<'a> State<'a> {
             .unwrap();
         let caps = surface.get_capabilities(&adapter);
 
+        let surface_format = if let Some(ref requested_format) = args.format {
+            let matched = caps
+                .formats
+                .iter()
+                .find(|f| format!("{:?}", f).eq_ignore_ascii_case(requested_format));
+
+            match matched {
+                Some(f) => *f,
+                None => {
+                    println!(
+                        "Error: Invalid or unsupported format '{}'",
+                        requested_format
+                    );
+                    println!("Available formats for this surface:");
+                    for f in &caps.formats {
+                        println!("  {:?}", f);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            caps.formats
+                .iter()
+                .find(|f| **f == wgpu::TextureFormat::Bgra8UnormSrgb)
+                .copied()
+                .unwrap_or(caps.formats[0])
+        };
+
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -90,6 +120,20 @@ impl<'a> State<'a> {
         } else {
             wgpu::PresentMode::Fifo
         };
+
+        println!("Surface Format: {:?}", surface_format);
+        println!("Present Mode: {:?}", present_mode);
+
+        if present_mode == wgpu::PresentMode::Fifo {
+            println!("NOTE: In Fifo mode, ACQ (Acquire) metrics will likely stay at 0.0ms.");
+            println!("      This is because the driver and compositor handle synchronization");
+            println!("      internally, often masking the acquisition handshake time.\n");
+        }
+
+        println!("MODE EXPLANATIONS:");
+        println!("  - Fifo: Standard VSync. Blocks CPU until the next monitor refresh.");
+        println!("  - Mailbox: Triple Buffering. Never blocks, replaces the last waiting frame.");
+        println!("  - Immediate: Uncapped. Renders as fast as possible, may cause tearing.\n");
 
         let uniforms = ShaderUniforms {
             color: [args.red, args.green, args.blue, 1.0],
@@ -133,16 +177,15 @@ impl<'a> State<'a> {
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: caps.formats[0],
-            width: size.width.max(1),
-            height: size.height.max(1),
+            format: surface_format,
+            width: size.width,
+            height: size.height,
             present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed("
@@ -480,7 +523,7 @@ impl<'a> ApplicationHandler for App<'a> {
         let attributes =
             WindowAttributes::default().with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = Arc::new(el.create_window(attributes).unwrap());
-        self.state = Some(pollster::block_on(State::new(window, self.args)));
+        self.state = Some(pollster::block_on(State::new(window, self.args.clone())));
 
         println!(
             "\nMETRIC LEGEND:\n\
