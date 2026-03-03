@@ -1,4 +1,7 @@
 use clap::Parser;
+use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -29,6 +32,10 @@ struct Args {
     format: Option<String>,
     #[arg(short = 'm', long)]
     mode: Option<String>,
+    #[arg(long, default_value_t = 80)]
+    steps: u32,
+    #[arg(long)]
+    csv: Option<String>,
 }
 
 #[repr(C)]
@@ -38,7 +45,7 @@ struct ShaderUniforms {
     cube_count: u32,
     size: f32,
     speed: f32,
-    _padding: f32,
+    steps: u32,
     fps_data: [f32; 4],
     adv_data: [f32; 4],
 }
@@ -57,10 +64,14 @@ struct State<'a> {
     last_frame_time: std::time::Instant,
     frame_count: u32,
     dropped_frames: u32,
-    frame_times: Vec<f32>,
+    /// Rolling window capped at 3600 samples (~1s at 3600fps, ~60s at 60fps).
+    frame_times: VecDeque<f32>,
+    /// Frame budget in ms derived from the monitor's actual refresh rate.
+    frame_budget_ms: f32,
     current_fps: f32,
     min_fps: f32,
     max_fps: f32,
+    csv_file: Option<std::fs::File>,
     args: Args,
 }
 
@@ -71,6 +82,18 @@ impl<'a> State<'a> {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
+
+        let frame_budget_ms = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| 1_000_000.0 / mhz as f32) // millihertz → ms per frame
+            .unwrap_or(16.666);
+
+        println!(
+            "Frame Budget: {:.3}ms ({:.1}Hz)",
+            frame_budget_ms,
+            1000.0 / frame_budget_ms
+        );
 
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
         let adapter = instance
@@ -162,12 +185,22 @@ impl<'a> State<'a> {
         println!("  - Mailbox: Triple Buffering. Never blocks, replaces the last waiting frame.");
         println!("  - Immediate: Uncapped. Renders as fast as possible, may cause tearing.\n");
 
+        let csv_file = args.csv.as_ref().map(|path| {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            let _ = writeln!(f, "FPS,MIN,MAX,LOW_1,JITTER,DROPPED,ACQ_TIME");
+            f
+        });
+
         let uniforms = ShaderUniforms {
             color: [args.red, args.green, args.blue, 1.0],
             cube_count: args.cubes.min(128),
             size: args.size,
             speed: args.speed,
-            _padding: 0.0,
+            steps: args.steps,
             fps_data: [0.0, 0.0, 0.0, 0.0],
             adv_data: [0.0, 0.0, 0.0, 0.0],
         };
@@ -221,7 +254,7 @@ impl<'a> State<'a> {
                     cube_count: u32,
                     size: f32,
                     speed: f32,
-                    padding: f32,
+                    steps: u32,
                     fps_data: vec4<f32>,
                     adv_data: vec4<f32>,
                 };
@@ -312,7 +345,7 @@ impl<'a> State<'a> {
                     var rd = normalize(vec3(uv, -1.8));
 
                     var total = 0.0; var hit = false; var p: vec3<f32>;
-                    for(var i=0; i<80; i++) {
+                    for(var i=0u; i<u.steps; i++) {
                         p = ro + rd * total;
                         let d = map(p, t);
                         if d < 0.002 { hit = true; break; }
@@ -324,12 +357,14 @@ impl<'a> State<'a> {
                     if !hit {
                         color = mix(vec3(0.01, 0.02, 0.05), vec3(0.05, 0.08, 0.15), in.uv.y * 0.5 + 0.5) + grain * 0.04;
                     } else {
-                        let eps = vec2(0.005, 0.0);
-                        let n = normalize(vec3(
-                            map(p+eps.xyy, t)-map(p-eps.xyy, t), 
-                            map(p+eps.yxy, t)-map(p-eps.yxy, t), 
-                            map(p+eps.yyx, t)-map(p-eps.yyx, t)
-                        ));
+                        let eps = 0.005;
+                        let k = vec2(1.0, -1.0);
+                        let n = normalize(
+                            k.xyy * map(p + k.xyy * eps, t) +
+                            k.yyx * map(p + k.yyx * eps, t) +
+                            k.yxy * map(p + k.yxy * eps, t) +
+                            k.xxx * map(p + k.xxx * eps, t)
+                        );
                         let light = max(dot(n, normalize(vec3(1.0, 2.0, 1.0))), 0.2);
                         color = u.color.rgb * light + grain * 0.03;
                     }
@@ -427,20 +462,29 @@ impl<'a> State<'a> {
             last_frame_time: std::time::Instant::now(),
             frame_count: 0,
             dropped_frames: 0,
-            frame_times: Vec::with_capacity(120),
+            frame_times: VecDeque::with_capacity(3600),
+            frame_budget_ms,
             current_fps: 0.0,
             min_fps: 0.0,
             max_fps: 0.0,
+            csv_file,
             args,
         }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Snapshot before acquire so delta excludes swapchain stall
         let frame_start = std::time::Instant::now();
+        let total_frame_delta = frame_start
+            .duration_since(self.last_frame_time)
+            .as_secs_f32()
+            * 1000.0;
+        self.last_frame_time = frame_start;
 
         // Measure JIT/Back-pressure: How long does the swapchain block us?
+        let acquire_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
-        let acquire_time = frame_start.elapsed().as_secs_f32() * 1000.0;
+        let acquire_time = acquire_start.elapsed().as_secs_f32() * 1000.0;
 
         let view = output
             .texture
@@ -473,19 +517,21 @@ impl<'a> State<'a> {
         output.present();
 
         self.frame_count += 1;
-        let now = std::time::Instant::now();
-        let total_frame_delta = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
 
         //FIXME: To get true, microsecond-accurate frame pacing, we need hardware-level presentation timestamps
+        // In Fifo the driver absorbs the vsync wait internally before returning from get_current_texture(), so our CPU timer is ~0ms.
+        // hardware timestamps would also improve Immediate/Mailbox precision.
         // https://docs.rs/wgpu/latest/wgpu/struct.PresentationTimestamp.html
         if total_frame_delta > self.args.threshold {
-            self.dropped_frames += (total_frame_delta / 16.66).floor() as u32;
+            self.dropped_frames += (total_frame_delta / self.frame_budget_ms).floor() as u32;
         }
 
-        self.frame_times.push(total_frame_delta);
-        self.last_frame_time = now;
+        self.frame_times.push_back(total_frame_delta);
+        if self.frame_times.len() > 3600 {
+            self.frame_times.pop_front();
+        }
 
-        let diff = now.duration_since(self.last_fps_update);
+        let diff = frame_start.duration_since(self.last_fps_update);
         if diff.as_secs_f32() >= 0.5 {
             self.current_fps = self.frame_count as f32 / diff.as_secs_f32();
             if self.min_fps == 0.0 || self.current_fps < self.min_fps {
@@ -507,34 +553,48 @@ impl<'a> State<'a> {
             };
 
             // Calculate 1% Lows
-            self.frame_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            let one_percent_index = ((self.frame_times.len() as f32 * 0.01).ceil() as usize)
+            let mut sorted_times: Vec<f32> = self.frame_times.iter().copied().collect();
+            sorted_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let one_percent_index = ((sorted_times.len() as f32 * 0.01).ceil() as usize)
                 .max(1)
-                .min(self.frame_times.len());
-            let avg_1pct_time: f32 = self.frame_times[..one_percent_index].iter().sum::<f32>()
-                / one_percent_index as f32;
+                .min(sorted_times.len());
+            let avg_1pct_time: f32 =
+                sorted_times[..one_percent_index].iter().sum::<f32>() / one_percent_index as f32;
             let low_1_fps = if avg_1pct_time > 0.0 {
                 1000.0 / avg_1pct_time
             } else {
                 0.0
             };
 
+            if let Some(ref mut file) = self.csv_file {
+                let _ = writeln!(
+                    file,
+                    "{:.2},{:.2},{:.2},{:.2},{:.4},{},{:.4}",
+                    self.current_fps,
+                    self.min_fps,
+                    self.max_fps,
+                    low_1_fps,
+                    jitter,
+                    self.dropped_frames,
+                    acquire_time
+                );
+            }
+
             let uniforms = ShaderUniforms {
                 color: [self.args.red, self.args.green, self.args.blue, 1.0],
                 cube_count: self.args.cubes.min(128),
                 size: self.args.size,
                 speed: self.args.speed,
-                _padding: 0.0,
+                steps: self.args.steps,
                 fps_data: [self.current_fps, self.min_fps, self.max_fps, low_1_fps],
                 adv_data: [jitter, self.dropped_frames as f32, acquire_time, 0.0],
             };
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-            self.frame_times.clear();
             self.frame_count = 0;
             self.dropped_frames = 0;
-            self.last_fps_update = now;
+            self.last_fps_update = frame_start;
         }
         Ok(())
     }
