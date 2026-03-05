@@ -1,3 +1,35 @@
+## General Performance Throughput
+
+- **FPS (Frames Per Second)**
+  The rolling average of frames rendered over the last 500ms update window. This represents the baseline rendering throughput of the GPU and the application loop.
+
+- **MIN (Minimum FPS)**
+  The absolute lowest 500ms rolling average recorded since the application started. This highlights sustained worst-case performance under maximum load.
+
+- **MAX (Maximum FPS)**
+  The absolute highest 500ms rolling average recorded. This represents peak hardware capability when the raymarching shader is under minimal load (e.g., few overlapping cubes in the view frustum).
+
+- **LOW (1% Low FPS)**
+  The average frame rate calculated exclusively from the slowest 1% of frame times within the rolling window. This is the primary indicator of subjective smoothness. A high average FPS combined with a poor 1% Low indicates isolated, severe frame drops that the user will perceive as stutter.
+
+## Advanced Pacing & Stability
+
+- **JIT (Jitter)**
+  The average variance (in milliseconds) between consecutive frame times. Calculated as the mean of `abs(frame_time[i] - frame_time[i-1])`. High jitter indicates inconsistent frame pacing. Even if the application averages a perfect 60 FPS (16.6ms), alternating between 10ms and 23ms frames will produce a visually unpleasant micro-stuttering experience.
+
+- **MSD (Missed Frames)**
+  A per-window counter of macro-stutters and severe application stalls. A frame is only evaluated here if its duration exceeds the configurable threshold (default: `25.0ms`). When a stall occurs, the total lost time is divided by the monitor's actual frame budget (queried at startup from the display's refresh rate) to calculate the discrete number of dropped presentation beats. This explicitly isolates true hardware/engine hitches from standard compositor noise.
+
+- **FTV (Frame Time Variance %)**
+  The coefficient of variation of frame times within the rolling window, expressed as a percentage (`stddev / mean * 100`). This metric directly captures how evenly frames are distributed across the 1000ms budget.
+
+  A value near **0%** means all frames took approximately the same time perfectly uniform delivery. A high value means frame times are spread widely: some frames complete in a few milliseconds while others take tens of milliseconds. Even if the mean FPS looks acceptable, this imbalance causes frames to bunch together and then stall, which the eye perceives as judder or skipping.
+
+  > **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
+
+  > **Note:** FTV is measured entirely from CPU-side frame timestamps and is equally valid across all Wayland compositors (wlroots, Smithay, Mutter and so on) regardless of how each compositor internally schedules frame callbacks or swapchain synchronization.
+
+
 ## GAMESCOPE
 
 | FPS   | MIN   | MAX   | LOW_1 | JITTER | DROPPED | FTV   |
