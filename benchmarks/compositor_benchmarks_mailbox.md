@@ -7,9 +7,19 @@
     driverName         = radv
     driverInfo         = Mesa 26.1.0-devel (git-1e1d8931c7)
 
+    
+    METRIC LEGEND:
+    ==============
+    FPS:  Average Frames Per Second
+    MIN:  Minimum FPS observed
+    MAX:  Maximum FPS observed
+    LOW:  1% Low FPS (stutter indicator)
+    JIT:  Frame-to-frame variance (ms)
+    MSD:  Missed frames (>25.0ms threshold)
+    ACQ:  Compositor swapchain latency (ms)
 ---
 
-### ACQ DATA (mailbox mode only) not reliable and not working well in wlroots compositors.
+### ACQ DATA not reliable and not working well in most compositors.
 
 ## Gamescope
 
