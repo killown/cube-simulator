@@ -9,6 +9,8 @@
 
 ---
 
+### ACQ DATA (mailbox mode only) not reliable and not working well in wlroots compositors.
+
 ## Gamescope
 
 | FPS   | MIN   | MAX   | LOW_1 | JITTER  | DROPPED | ACQ_TIME |
