@@ -381,12 +381,12 @@ impl<'a> State<'a> {
                     // Row 1: MIN  (M=24429, I=29847, N=24557)
                     let r1 = base_uv - vec2(0.0, 6.0);
                     d = max(d, max(sd_char(r1, 24429), max(sd_char(r1 - vec2(4.0, 0.0), 29847), sd_char(r1 - vec2(8.0, 0.0), 24557))));
-                    d = max(d, draw_num(r1 - vec2(14.0, 0.0), i32(u.fps_data.z)));
+                    d = max(d, draw_num(r1 - vec2(14.0, 0.0), i32(u.fps_data.y)));
 
                     // Row 2: MAX  (M=24429, A=11245, X=23213)
                     let r2 = base_uv - vec2(0.0, 12.0);
                     d = max(d, max(sd_char(r2, 24429), max(sd_char(r2 - vec2(4.0, 0.0), 11245), sd_char(r2 - vec2(8.0, 0.0), 23213))));
-                    d = max(d, draw_num(r2 - vec2(14.0, 0.0), i32(u.fps_data.y)));
+                    d = max(d, draw_num(r2 - vec2(14.0, 0.0), i32(u.fps_data.z)));
 
                     // Row 3: LOW  (L=4687, O=31599, W=23418)
                     let r3 = base_uv - vec2(0.0, 18.0);
