@@ -1,21 +1,21 @@
 # WGPU Cube Simulator
 
-This project is a high-precision diagnostic tool built with **Rust** and **WGPU** to measure **JIT (Just-In-Time) presentation latency** and frame pacing stability under heavy load. By utilizing a raymarched fragment shader rather than standard rasterization, it allows for granular control over GPU throughput to identify compositor bottlenecks and V-Sync implementation flaws.
+This project is a high-precision diagnostic tool built with **Rust** and **WGPU** to measure **frame pacing stability and presentation latency** under heavy GPU load. By utilizing a raymarched fragment shader rather than standard rasterization, it allows for granular control over GPU throughput to identify compositor bottlenecks and V-Sync implementation flaws.
 
 ---
 
 > [!IMPORTANT]
 > **Priority One:** For effective diagnostic testing, the workload should be increased (using the `--cubes` argument) until the **FPS drops below 60**.
 >
-> Saturating the GPU to this level is the only way to reliably expose frame pacing issues, as it removes any "buffer cushion" and forces the compositor's synchronization flaws to manifest as visible stutter or JIT spikes.
+> Saturating the GPU to this level is the only way to reliably expose frame pacing issues, as it removes any "buffer cushion" and forces the compositor's synchronization flaws to manifest as visible stutter or pacing spikes.
 
-- **JIT Detection:** Identifies the delta between application-side render submission and hardware-side presentation.
+- **Pacing Detection:** Measures the statistical spread of frame delivery times to identify bunching and skipping invisible to raw FPS counters.
 - **Compositor Benchmarking:** Highlights the architectural gap between modern compositors.
 - **V-Sync Profiling:** Specifically targets the detection of "Back-Pressure" in the swapchain, where missed V-Blank intervals at high refresh rates cause cascading latency spikes.
 
 ### Installation and Usage
 
-To get accurate JIT metrics, you must compile with the release profile to minimize CPU-side scheduling interference and driver overhead:
+To get accurate metrics, you must compile with the release profile to minimize CPU-side scheduling interference and driver overhead:
 
     cargo build --release
     ./target/release/frame-test -c 120
@@ -40,8 +40,8 @@ To get accurate JIT metrics, you must compile with the release profile to minimi
 
 The simulator automatically selects the best available present mode (Mailbox > Immediate > Fifo) and prints the selection to the terminal with the following behavior:
 
-- **Fifo (Standard VSync):** Standard VSync logic. Blocks the CPU to match the monitor's refresh rate. **Note:** In this mode, ACQ (Acquire) metrics will stay at 0.0ms as the driver handles synchronization internally, masking acquisition handshake time.
-- **Mailbox (Triple Buffering):** A non-blocking mode that replaces the oldest frame in the queue. Ideal for measuring compositor release latency (ACQ).
+- **Fifo (Standard VSync):** Standard VSync logic. Blocks the CPU to match the monitor's refresh rate. The driver and compositor handle synchronization internally; frame pacing is controlled via the display refresh cycle.
+- **Mailbox (Triple Buffering):** A non-blocking mode that replaces the oldest frame in the queue. Ideal for measuring raw compositor scheduling behaviour.
 - **Immediate (Uncapped):** Renders as fast as possible without sync, providing the rawest performance data but potentially causing screen tearing.
 
 ---
@@ -109,15 +109,21 @@ target/release/frame-test
 ## Advanced Pacing & Stability
 
 - **JIT (Jitter)**
-  The average variance (in milliseconds) between consecutive frame times. Calculated mathematically as the average of `abs(frame_time[i] - frame_time[i-1])`. High jitter indicates inconsistent frame pacing. Even if the application averages a perfect 60 FPS (16.6ms), alternating between 10ms and 23ms frames will produce a visually unpleasant, "micro-stuttering" experience.
+  The average variance (in milliseconds) between consecutive frame times. Calculated as the mean of `abs(frame_time[i] - frame_time[i-1])`. High jitter indicates inconsistent frame pacing. Even if the application averages a perfect 60 FPS (16.6ms), alternating between 10ms and 23ms frames will produce a visually unpleasant micro-stuttering experience.
 
 - **MSD (Missed Frames)**
   A per-window counter of macro-stutters and severe application stalls. A frame is only evaluated here if its duration exceeds the configurable threshold (default: `25.0ms`). When a stall occurs, the total lost time is divided by the monitor's actual frame budget (queried at startup from the display's refresh rate) to calculate the discrete number of dropped presentation beats. This explicitly isolates true hardware/engine hitches from standard compositor noise.
 
-- **ACQ (Acquire Time)**
-  The CPU-side duration (in milliseconds) the application thread is blocked waiting for `surface.get_current_texture()`. This metric maps directly to presentation back-pressure from the display server or Wayland compositor. If the compositor's buffers are saturated, or it is intentionally throttling the application to maintain desktop stability, `ACQ` will spike. This proves the bottleneck exists in the OS presentation layer, not the application's internal GPU work submission.
+- **FTV (Frame Time Variance %)**
+  The coefficient of variation of frame times within the rolling window, expressed as a percentage (`stddev / mean * 100`). This metric directly captures how evenly frames are distributed across the 1000ms budget.
 
-  > **Note:** ACQ is a CPU-side measurement only. Hardware-level presentation timestamps (`VK_GOOGLE_display_timing`) are not yet surfaced through the wgpu public API, so sub-millisecond scanout accuracy is not currently available. In **Fifo** mode ACQ will read ~0ms regardless of load, as the driver absorbs the vsync wait internally before returning from `get_current_texture()`.
+  A value near **0%** means all frames took approximately the same time perfectly uniform delivery. A high value means frame times are spread widely: some frames complete in a few milliseconds while others take tens of milliseconds. Even if the mean FPS looks acceptable, this imbalance causes frames to bunch together and then stall, which the eye perceives as judder or skipping.
+
+  > **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
+
+  > **Note:** FTV is measured entirely from CPU-side frame timestamps and is equally valid across all Wayland compositors (wlroots, Smithay, Mutter and so on) regardless of how each compositor internally schedules frame callbacks or swapchain synchronization.
+
+---
 
 ### Performance Note: Why Raymarching?
 

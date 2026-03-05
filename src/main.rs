@@ -47,6 +47,7 @@ struct ShaderUniforms {
     speed: f32,
     steps: u32,
     fps_data: [f32; 4],
+    /// [jitter, dropped, ftv, _pad]
     adv_data: [f32; 4],
 }
 
@@ -175,9 +176,10 @@ impl<'a> State<'a> {
         println!("Present Mode: {:?}", present_mode);
 
         if present_mode == wgpu::PresentMode::Fifo {
-            println!("NOTE: In Fifo mode, ACQ (Acquire) metrics will likely stay at 0.0ms.");
-            println!("      This is because the driver and compositor handle synchronization");
-            println!("      internally, often masking the acquisition handshake time.\n");
+            println!("NOTE: In Fifo mode, the driver and compositor handle synchronization");
+            println!(
+                "      internally. Frame pacing is controlled via the display refresh cycle.\n"
+            );
         }
 
         println!("MODE EXPLANATIONS:");
@@ -191,7 +193,7 @@ impl<'a> State<'a> {
                 .append(true)
                 .open(path)
                 .unwrap();
-            let _ = writeln!(f, "FPS,MIN,MAX,LOW_1,JITTER,DROPPED,ACQ_TIME");
+            let _ = writeln!(f, "FPS,MIN,MAX,LOW_1,JITTER,DROPPED,FTV");
             f
         });
 
@@ -372,40 +374,41 @@ impl<'a> State<'a> {
                     let scale = 110.0;
                     let base_uv = vec2((in.uv.x - (-0.98)) * scale, (0.98 - in.uv.y) * scale);
 
-                    // Row 0: FPS
+                    // Row 0: FPS  (F=29385, P=31689, S=29671)
                     var d = max(sd_char(base_uv, 29385), max(sd_char(base_uv - vec2(4.0, 0.0), 31689), sd_char(base_uv - vec2(8.0, 0.0), 29671)));
                     d = max(d, draw_num(base_uv - vec2(14.0, 0.0), i32(u.fps_data.x)));
 
-                    // Row 1: MIN
+                    // Row 1: MIN  (M=24429, I=29847, N=24557)
                     let r1 = base_uv - vec2(0.0, 6.0);
-                    d = max(d, max(sd_char(r1, 24429), max(sd_char(r1 - vec2(4.0, 0.0), 11245), sd_char(r1 - vec2(8.0, 0.0), 23213))));
+                    d = max(d, max(sd_char(r1, 24429), max(sd_char(r1 - vec2(4.0, 0.0), 29847), sd_char(r1 - vec2(8.0, 0.0), 24557))));
                     d = max(d, draw_num(r1 - vec2(14.0, 0.0), i32(u.fps_data.z)));
 
-                    // Row 2: MAX
+                    // Row 2: MAX  (M=24429, A=11245, X=23213)
                     let r2 = base_uv - vec2(0.0, 12.0);
-                    d = max(d, max(sd_char(r2, 24429), max(sd_char(r2 - vec2(4.0, 0.0), 29847), sd_char(r2 - vec2(8.0, 0.0), 23533))));
+                    d = max(d, max(sd_char(r2, 24429), max(sd_char(r2 - vec2(4.0, 0.0), 11245), sd_char(r2 - vec2(8.0, 0.0), 23213))));
                     d = max(d, draw_num(r2 - vec2(14.0, 0.0), i32(u.fps_data.y)));
 
-                    // Row 3: LOW
+                    // Row 3: LOW  (L=4687, O=31599, W=23418)
                     let r3 = base_uv - vec2(0.0, 18.0);
-                    d = max(d, max(sd_char(r3, 9879), max(sd_char(r3 - vec2(4.0, 0.0), 22669), sd_char(r3 - vec2(8.0, 0.0), 4687))));
+                    d = max(d, max(sd_char(r3, 4687), max(sd_char(r3 - vec2(4.0, 0.0), 31599), sd_char(r3 - vec2(8.0, 0.0), 23418))));
                     d = max(d, draw_num(r3 - vec2(14.0, 0.0), i32(u.fps_data.w)));
 
-                    // Row 4: JIT
+                    // Row 4: JIT  (J=26926, I=29847, T=29842)
                     let r4 = base_uv - vec2(0.0, 24.0);
-                    d = max(d, max(sd_char(r4, 31023), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
+                    d = max(d, max(sd_char(r4, 26926), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
                     d = max(d, draw_num(r4 - vec2(14.0, 0.0), i32(u.adv_data.x)));
 
-                    // Row 5: MSD
+                    // Row 5: MSD  (M=24429, S=29671, D=15211)
                     let r5 = base_uv - vec2(0.0, 30.0);
-                    let char_m = 24429; let char_s = 29671; let char_d = 27503;
-                    d = max(d, max(sd_char(r5, char_m), max(sd_char(r5 - vec2(4.0, 0.0), char_s), sd_char(r5 - vec2(8.0, 0.0), char_d))));
+                    d = max(d, max(sd_char(r5, 24429), max(sd_char(r5 - vec2(4.0, 0.0), 29671), sd_char(r5 - vec2(8.0, 0.0), 15211))));
                     d = max(d, draw_num(r5 - vec2(14.0, 0.0), i32(u.adv_data.y)));
 
-                    // Row 6: ACQ
+                    // Row 6: FTV  (F=29385, T=29842, V=23378)
+                    // Frame Time Variance %: stddev/mean*100 over the rolling window.
+                    // 0% = all frames equally spaced, high % = frames bunching and
+                    // skipping — visually skippy even if mean FPS looks acceptable.
                     let r6 = base_uv - vec2(0.0, 36.0);
-                    let char_a = 31725; let char_c = 29263; let char_q = 31612;
-                    d = max(d, max(sd_char(r6, char_a), max(sd_char(r6 - vec2(4.0, 0.0), char_c), sd_char(r6 - vec2(8.0, 0.0), char_q))));
+                    d = max(d, max(sd_char(r6, 29385), max(sd_char(r6 - vec2(4.0, 0.0), 29842), sd_char(r6 - vec2(8.0, 0.0), 23378))));
                     d = max(d, draw_num(r6 - vec2(14.0, 0.0), i32(u.adv_data.z)));
 
                     return vec4(mix(color, vec3(0.0, 1.0, 0.5), d), 1.0);
@@ -482,9 +485,7 @@ impl<'a> State<'a> {
         self.last_frame_time = frame_start;
 
         // Measure JIT/Back-pressure: How long does the swapchain block us?
-        let acquire_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
-        let acquire_time = acquire_start.elapsed().as_secs_f32() * 1000.0;
 
         let view = output
             .texture
@@ -552,6 +553,30 @@ impl<'a> State<'a> {
                 0.0
             };
 
+            // FTV (Frame Time Variance %): coefficient of variation of frame times within
+            // the rolling window, expressed as a percentage. Measures how evenly frames
+            // are spaced across the 1000ms budget — 0% is perfectly uniform delivery,
+            // high values mean frames are bunching (some very fast, some very slow),
+            // which the eye perceives as judder even when mean FPS looks acceptable.
+            // e.g. frames of [5ms, 48ms, 6ms, 47ms] at "~20fps" will look skippy
+            // because visually two frames arrive nearly simultaneously then a long gap.
+            let mean = if !self.frame_times.is_empty() {
+                self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32
+            } else {
+                0.0
+            };
+            let ftv = if mean > 0.0 && self.frame_times.len() > 1 {
+                let variance = self
+                    .frame_times
+                    .iter()
+                    .map(|&t| (t - mean).powi(2))
+                    .sum::<f32>()
+                    / (self.frame_times.len() - 1) as f32;
+                (variance.sqrt() / mean * 100.0).min(999.0)
+            } else {
+                0.0
+            };
+
             // Calculate 1% Lows
             let mut sorted_times: Vec<f32> = self.frame_times.iter().copied().collect();
             sorted_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -569,14 +594,14 @@ impl<'a> State<'a> {
             if let Some(ref mut file) = self.csv_file {
                 let _ = writeln!(
                     file,
-                    "{:.2},{:.2},{:.2},{:.2},{:.4},{},{:.4}",
+                    "{:.2},{:.2},{:.2},{:.2},{:.4},{},{:.2}",
                     self.current_fps,
                     self.min_fps,
                     self.max_fps,
                     low_1_fps,
                     jitter,
                     self.dropped_frames,
-                    acquire_time
+                    ftv,
                 );
             }
 
@@ -587,7 +612,7 @@ impl<'a> State<'a> {
                 speed: self.args.speed,
                 steps: self.args.steps,
                 fps_data: [self.current_fps, self.min_fps, self.max_fps, low_1_fps],
-                adv_data: [jitter, self.dropped_frames as f32, acquire_time, 0.0],
+                adv_data: [jitter, self.dropped_frames as f32, ftv, 0.0],
             };
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -621,7 +646,9 @@ impl<'a> ApplicationHandler for App<'a> {
             LOW:  1% Low FPS (stutter indicator)\n\
             JIT:  Frame-to-frame variance (ms)\n\
             MSD:  Missed frames (>{:.1}ms threshold)\n\
-            ACQ:  Compositor swapchain latency (ms)\n",
+            FTV:  Frame Time Variance %% — stddev/mean of frame times in the rolling window.\n\
+                  0%% = perfectly uniform delivery. High %% = frames bunching (some near-instant,\n\
+                  some very slow), which looks skippy even when mean FPS appears acceptable.\n",
             self.args.threshold
         );
     }
