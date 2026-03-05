@@ -1,4 +1,4 @@
-# Benchmark Data (fifo mode) RX 9060 XT 16GB
+# Benchmark Data (fifo mode) RX 9060 XT 16GB - 120 cubes
 
     apiVersion         = 1.4.344
     driverVersion      = 26.0.99
@@ -16,6 +16,7 @@
     JIT:  Frame-to-frame variance (ms)
     MSD:  Missed frames (>25.0ms threshold)
     ACQ:  Compositor swapchain latency (ms)
+
 ---
 
 ### ACQ DATA not reliable and not working well in most compositors.
