@@ -38,7 +38,7 @@ Performance analysis of the Cube Simulator using different Vulkan presentation m
 The benchmarks were executed under the following strict conditions to ensure data consistency:
 
 - **Duration:** 1 minute per run (`timeout 1m`).
-- **Workload:** 90 cubes (`-c 90`).
+- **Workload:** 120 cubes (`-c 120`).
 - **Data Capture:** Metrics sampled every 500ms.
 - **Storage:** Every run generates a data file (`.csv` or `.json`) and a paired `-info.txt` file containing the command string, system stats, and hardware state at execution time.
 - **Comparison:** Identical workloads applied to **FIFO** (Standard VSync) and **Mailbox** (Triple Buffering) to measure compositor back-pressure and frame pacing across different environments.
