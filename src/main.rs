@@ -199,7 +199,7 @@ impl<'a> State<'a> {
 
         let uniforms = ShaderUniforms {
             color: [args.red, args.green, args.blue, 1.0],
-            cube_count: args.cubes.min(128),
+            cube_count: args.cubes,
             size: args.size,
             speed: args.speed,
             steps: args.steps,
@@ -607,7 +607,7 @@ impl<'a> State<'a> {
 
             let uniforms = ShaderUniforms {
                 color: [self.args.red, self.args.green, self.args.blue, 1.0],
-                cube_count: self.args.cubes.min(128),
+                cube_count: self.args.cubes,
                 size: self.args.size,
                 speed: self.args.speed,
                 steps: self.args.steps,
