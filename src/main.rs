@@ -16,7 +16,7 @@ use winit::{
 struct Args {
     #[arg(short, long, default_value_t = 6)]
     cubes: u32,
-    #[arg(short, long, default_value_t = 0.5)]
+    #[arg(short = 'z', long, default_value_t = 0.5)]
     size: f32,
     #[arg(short, long, default_value_t = 1.0)]
     speed: f32,
