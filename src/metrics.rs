@@ -1,15 +1,10 @@
+// metrics.rs
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
 
-/// Rolling-window frame timing statistics.
-///
-/// All computation is pure (no GPU interaction). The caller is responsible
-/// for feeding raw frame deltas and reading back the derived metrics.
 pub struct FrameMetrics {
-    /// Rolling window capped at 3600 samples (~1s at 3600fps, ~60s at 60fps).
     pub frame_times: VecDeque<f32>,
-    /// Frame budget in ms derived from the monitor's actual refresh rate.
     pub frame_budget_ms: f32,
     pub frame_count: u32,
     pub dropped_frames: u32,
@@ -17,9 +12,13 @@ pub struct FrameMetrics {
     pub min_fps: f32,
     pub max_fps: f32,
     pub last_fps_update: std::time::Instant,
+    /// Ring of raw hardware presentation timestamps (nanoseconds).
+    /// `None` slots mean the backend returned `UNSUPPORTED`.
+    presentation_timestamps: VecDeque<Option<u64>>,
+    /// Whether the backend has ever returned a valid hardware timestamp.
+    hw_timestamps_available: bool,
 }
 
-/// Derived statistics emitted every half-second update tick.
 #[derive(Debug, Clone, Copy)]
 pub struct TickStats {
     pub current_fps: f32,
@@ -29,6 +28,10 @@ pub struct TickStats {
     pub jitter: f32,
     pub dropped_frames: u32,
     pub ftv: f32,
+    /// `true` when jitter/ftv are derived from KMS flip timestamps rather than
+    /// CPU-side `Instant` deltas. When `false`, `max_render_time` on a Mailbox
+    /// compositor can artificially deflate these values.
+    pub hw_verified: bool,
 }
 
 impl FrameMetrics {
@@ -44,10 +47,17 @@ impl FrameMetrics {
             min_fps: 0.0,
             max_fps: 0.0,
             last_fps_update: now,
+            presentation_timestamps: VecDeque::with_capacity(3600),
+            hw_timestamps_available: false,
         }
     }
 
-    /// Records one frame delta and increments drop counters when over budget.
+    /// Records one frame delta and its hardware presentation timestamp.
+    ///
+    /// `presentation_ts` should come directly from
+    /// `wgpu::Queue::get_timestamp_period`-gated `SurfaceTexture::presentation_timestamp()`.
+    /// When the backend returns [`wgpu::PresentationTimestamp::INVALID`], pass `None`
+    /// and the metric pipeline falls back to CPU-side deltas with `hw_verified: false`.
     ///
     /// Returns `Some(TickStats)` every 500ms update interval; `None` otherwise.
     pub fn push(
@@ -55,12 +65,15 @@ impl FrameMetrics {
         delta_ms: f32,
         threshold_ms: f32,
         now: std::time::Instant,
+        presentation_ts: Option<u64>,
     ) -> Option<TickStats> {
-        //FIXME: To get true, microsecond-accurate frame pacing, we need hardware-level presentation timestamps
-        // In Fifo the driver absorbs the vsync wait internally before returning from get_current_texture(), so our CPU timer is ~0ms.
-        // hardware timestamps would also improve Immediate/Mailbox precision.
-        // https://docs.rs/wgpu/latest/wgpu/struct.PresentationTimestamp.html
         self.frame_count += 1;
+
+        if let Some(ts) = presentation_ts {
+            if ts != u64::MAX {
+                self.hw_timestamps_available = true;
+            }
+        }
 
         if delta_ms > threshold_ms {
             self.dropped_frames += (delta_ms / self.frame_budget_ms).floor() as u32;
@@ -69,6 +82,11 @@ impl FrameMetrics {
         self.frame_times.push_back(delta_ms);
         if self.frame_times.len() > 3600 {
             self.frame_times.pop_front();
+        }
+
+        self.presentation_timestamps.push_back(presentation_ts);
+        if self.presentation_timestamps.len() > 3600 {
+            self.presentation_timestamps.pop_front();
         }
 
         let diff = now.duration_since(self.last_fps_update);
@@ -94,43 +112,21 @@ impl FrameMetrics {
             self.max_fps = self.current_fps;
         }
 
-        // Calculate Jitter (Frame Time Variance)
-        let mut jitter_sum = 0.0;
-        for i in 1..self.frame_times.len() {
-            jitter_sum += (self.frame_times[i] - self.frame_times[i - 1]).abs();
-        }
-        let jitter = if self.frame_times.len() > 1 {
-            jitter_sum / (self.frame_times.len() - 1) as f32
+        let (jitter, ftv, hw_verified) = if self.hw_timestamps_available {
+            self.compute_hw_jitter_ftv()
         } else {
-            0.0
-        };
-
-        // FTV (Frame Time Variance %): coefficient of variation of frame times within
-        // the rolling window, expressed as a percentage. Measures how evenly frames
-        // are spaced across the 1000ms budget — 0% is perfectly uniform delivery,
-        // high values mean frames are bunching (some very fast, some very slow),
-        // which the eye perceives as judder even when mean FPS looks acceptable.
-        // e.g. frames of [5ms, 48ms, 6ms, 47ms] at "~20fps" will look skippy
-        // because visually two frames arrive nearly simultaneously then a long gap.
-        let mean = if !self.frame_times.is_empty() {
-            self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32
-        } else {
-            0.0
-        };
-        let ftv = if mean > 0.0 && self.frame_times.len() > 1 {
-            let variance = self
-                .frame_times
-                .iter()
-                .map(|&t| (t - mean).powi(2))
-                .sum::<f32>()
-                / (self.frame_times.len() - 1) as f32;
-            (variance.sqrt() / mean * 100.0).min(999.0)
-        } else {
-            0.0
+            (self.compute_cpu_jitter(), self.compute_cpu_ftv(), false)
         };
 
         // Calculate 1% Lows
-        let mut sorted_times: Vec<f32> = self.frame_times.iter().copied().collect();
+        let source_times = self.hw_frame_times_ms();
+        let times_for_lows = if source_times.is_empty() {
+            self.frame_times.iter().copied().collect::<Vec<_>>()
+        } else {
+            source_times
+        };
+
+        let mut sorted_times = times_for_lows;
         sorted_times.sort_by(|a, b| b.partial_cmp(a).unwrap());
         let one_percent_index = ((sorted_times.len() as f32 * 0.01).ceil() as usize)
             .max(1)
@@ -151,6 +147,91 @@ impl FrameMetrics {
             jitter,
             dropped_frames: self.dropped_frames,
             ftv,
+            hw_verified,
+        }
+    }
+
+    /// Derives inter-frame deltas in milliseconds from consecutive KMS timestamps.
+    ///
+    /// Skips pairs where either slot is `None` or `u64::MAX` (unsupported).
+    fn hw_frame_times_ms(&self) -> Vec<f32> {
+        let ts: Vec<u64> = self
+            .presentation_timestamps
+            .iter()
+            .filter_map(|&t| t.filter(|&v| v != u64::MAX))
+            .collect();
+
+        ts.windows(2)
+            .map(|w| {
+                // nanoseconds → milliseconds; saturating to avoid wrapping on
+                // timestamp resets (e.g. CLOCK_MONOTONIC discontinuities).
+                w[1].saturating_sub(w[0]) as f32 / 1_000_000.0
+            })
+            .filter(|&ms| ms > 0.0 && ms < 1000.0) // discard absurd outliers
+            .collect()
+    }
+
+    /// Computes jitter and FTV from hardware KMS flip timestamps.
+    ///
+    /// Returns `(jitter_ms, ftv_percent, hw_verified: true)`.
+    fn compute_hw_jitter_ftv(&self) -> (f32, f32, bool) {
+        let hw_times = self.hw_frame_times_ms();
+        if hw_times.len() < 2 {
+            return (0.0, 0.0, false);
+        }
+
+        let jitter = {
+            let sum: f32 = hw_times.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+            sum / (hw_times.len() - 1) as f32
+        };
+
+        let mean = hw_times.iter().sum::<f32>() / hw_times.len() as f32;
+        let ftv = if mean > 0.0 {
+            let variance = hw_times.iter().map(|&t| (t - mean).powi(2)).sum::<f32>()
+                / (hw_times.len() - 1) as f32;
+            (variance.sqrt() / mean * 100.0).min(999.0)
+        } else {
+            0.0
+        };
+
+        (jitter, ftv, true)
+    }
+
+    fn compute_cpu_jitter(&self) -> f32 {
+        let mut sum = 0.0;
+        for i in 1..self.frame_times.len() {
+            sum += (self.frame_times[i] - self.frame_times[i - 1]).abs();
+        }
+        if self.frame_times.len() > 1 {
+            sum / (self.frame_times.len() - 1) as f32
+        } else {
+            0.0
+        }
+    }
+
+    // FTV (Frame Time Variance %): coefficient of variation of frame times within
+    // the rolling window, expressed as a percentage. Measures how evenly frames
+    // are spaced across the 1000ms budget — 0% is perfectly uniform delivery,
+    // high values mean frames are bunching (some very fast, some very slow),
+    // which the eye perceives as judder even when mean FPS looks acceptable.
+    // e.g. frames of [5ms, 48ms, 6ms, 47ms] at "~20fps" will look skippy
+    // because visually two frames arrive nearly simultaneously then a long gap.
+    fn compute_cpu_ftv(&self) -> f32 {
+        let mean = if !self.frame_times.is_empty() {
+            self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32
+        } else {
+            0.0
+        };
+        if mean > 0.0 && self.frame_times.len() > 1 {
+            let variance = self
+                .frame_times
+                .iter()
+                .map(|&t| (t - mean).powi(2))
+                .sum::<f32>()
+                / (self.frame_times.len() - 1) as f32;
+            (variance.sqrt() / mean * 100.0).min(999.0)
+        } else {
+            0.0
         }
     }
 }
@@ -163,7 +244,7 @@ pub fn write_csv_row(file: &mut Option<File>, stats: &TickStats) {
     if let Some(f) = file {
         let _ = writeln!(
             f,
-            "{:.2},{:.2},{:.2},{:.2},{:.4},{},{:.2}",
+            "{:.2},{:.2},{:.2},{:.2},{:.4},{},{:.2},{}",
             stats.current_fps,
             stats.min_fps,
             stats.max_fps,
@@ -171,6 +252,7 @@ pub fn write_csv_row(file: &mut Option<File>, stats: &TickStats) {
             stats.jitter,
             stats.dropped_frames,
             stats.ftv,
+            if stats.hw_verified { "hw" } else { "cpu" },
         );
     }
 }
@@ -183,7 +265,7 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
     if let Some(f) = file {
         let _ = writeln!(
             f,
-            r#"{{"fps":{:.2},"min":{:.2},"max":{:.2},"low_1":{:.2},"jitter":{:.4},"dropped":{},"ftv":{:.2}}}"#,
+            r#"{{"fps":{:.2},"min":{:.2},"max":{:.2},"low_1":{:.2},"jitter":{:.4},"dropped":{},"ftv":{:.2},"hw_verified":{}}}"#,
             stats.current_fps,
             stats.min_fps,
             stats.max_fps,
@@ -191,6 +273,7 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
             stats.jitter,
             stats.dropped_frames,
             stats.ftv,
+            stats.hw_verified,
         );
     }
 }

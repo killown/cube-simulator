@@ -37,6 +37,8 @@ To get accurate metrics, you must compile with the release profile to minimize C
 | `--csv`           | Optional path to write metrics as CSV for offline analysis (e.g., `--csv out.csv`).               | None             |
 | `--json`          | Optional path to write metrics as NDJSON for offline analysis (e.g., `--json out.json`).          | None             |
 
+> **`TS_SOURCE` column** (CSV/JSON output only): Each row includes a `TS_SOURCE` field set to either `hw` or `cpu`. `hw` means jitter and FTV for that window were computed from WSI-domain KMS flip timestamps (compositor-resistant). `cpu` means the backend returned an invalid presentation timestamp and the metrics fell back to CPU-side `Instant` deltas, which are subject to compositor scheduling (e.g. `max_render_time` on Mailbox). Treat `cpu`-sourced jitter/FTV as approximate.
+
 ### Present Mode Diagnostics
 
 The simulator automatically selects the best available present mode (Mailbox > Immediate > Fifo) and prints the selection to the terminal with the following behavior:
@@ -122,7 +124,10 @@ target/release/frame-test
 
   > **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
 
-  > **Note:** FTV is measured entirely from CPU-side frame timestamps and is equally valid across all Wayland compositors (wlroots, Smithay, Mutter and so on) regardless of how each compositor internally schedules frame callbacks or swapchain synchronization.
+  > **Note:** When `TS_SOURCE` is `hw`, FTV and JIT are derived from WSI-domain KMS flip timestamps and are compositor-resistant. When `TS_SOURCE` is `cpu`, they fall back to CPU-side `Instant` deltas, which are valid across all Wayland compositors but can be deflated by compositor scheduling (e.g. `max_render_time` on Mailbox present mode).
+
+- **TS_SOURCE (Timestamp Source)**
+  Indicates the clock domain used to compute jitter and FTV for each 500ms reporting window. `hw` means metrics were derived from hardware presentation timestamps returned by the WSI (Window System Integration) layer — on Vulkan/DRM backends these map directly to `CLOCK_MONOTONIC` KMS flip events and cannot be fabricated by the compositor. `cpu` means the WSI backend returned an invalid timestamp (common on OpenGL, XWayland, and some Vulkan ICDs without `VK_EXT_calibrated_timestamps`) and the metrics fell back to CPU `Instant` deltas. In `cpu` mode on Mailbox, compositor features such as `max_render_time` can make jitter and FTV appear artificially low.
 
 ---
 

@@ -19,10 +19,16 @@ pub struct State<'a> {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub window: Arc<Window>,
+    /// Retained to call `get_presentation_timestamp()` each frame.
+    adapter: wgpu::Adapter,
     render_pipeline: wgpu::RenderPipeline,
     uniform_binding: UniformBinding,
     start_time: std::time::Instant,
     last_frame_time: std::time::Instant,
+    /// WSI-domain timestamp from the previous frame's post-present sample.
+    /// Used to compute inter-frame deltas in the presentation engine's own
+    /// nanosecond clock, which `max_render_time` cannot shift.
+    last_pres_ts: Option<u64>,
     metrics: FrameMetrics,
     csv_file: Option<File>,
     json_file: Option<File>,
@@ -87,17 +93,65 @@ impl<'a> State<'a> {
         println!("  - Mailbox: Triple Buffering. Never blocks, replaces the last waiting frame.");
         println!("  - Immediate: Uncapped. Renders as fast as possible, may cause tearing.\n");
 
+        // Warn once if the backend does not support WSI-domain timestamps.
+        // In that case jitter/FTV fall back to CPU Instant deltas, which are
+        // schedulable by compositor tricks such as max_render_time.
+        {
+            let ts = adapter.get_presentation_timestamp();
+            if ts.is_invalid() {
+                eprintln!(
+                    "WARN: Backend does not support presentation timestamps — \
+                     jitter/FTV will use CPU timers (compositor-schedulable)"
+                );
+            } else {
+                println!("Presentation timestamps: available (WSI-domain, compositor-resistant)");
+            }
+        }
+
+        let cmd_line = std::env::args().collect::<Vec<_>>().join(" ");
+        let mut raw_header = format!("Command: {}\n", cmd_line);
+
+        if let Some(drm) = crate::drm::query() {
+            for c in &drm.connectors {
+                if let Some(m) = &c.active_mode {
+                    let vrr = match c.vrr_enabled {
+                        Some(true) => " (VRR: On)",
+                        Some(false) => " (VRR: Off)",
+                        None => "",
+                    };
+                    raw_header.push_str(&format!(
+                        "{}: {}x{} @ {}Hz{}\n",
+                        c.name, m.width, m.height, m.refresh_hz, vrr
+                    ));
+                }
+            }
+        }
+        raw_header.push_str(&format!("Surface Format: {:?}\n", surface_format));
+        raw_header.push_str(&format!("Present Mode: {:?}\n", present_mode));
+
+        let write_info = |base_path: &str, content: &str| {
+            let path = std::path::Path::new(base_path);
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let info_path = parent.join(format!("{}-info.txt", stem));
+            if let Ok(mut f) = std::fs::File::create(info_path) {
+                let _ = write!(f, "{}", content);
+            }
+        };
+
         let csv_file = args.csv.as_ref().map(|path| {
+            write_info(path, &raw_header);
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
                 .unwrap();
-            let _ = writeln!(f, "FPS,MIN,MAX,LOW_1,JITTER,DROPPED,FTV");
+            let _ = writeln!(f, "FPS,MIN,MAX,LOW_1,JITTER,DROPPED,FTV,TS_SOURCE");
             f
         });
 
         let json_file = args.json.as_ref().map(|path| {
+            write_info(path, &raw_header);
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -169,10 +223,12 @@ impl<'a> State<'a> {
             queue,
             config,
             window,
+            adapter,
             render_pipeline,
             uniform_binding,
             start_time: now,
             last_frame_time: now,
+            last_pres_ts: None,
             metrics: FrameMetrics::new(frame_budget_ms),
             csv_file,
             json_file,
@@ -223,10 +279,46 @@ impl<'a> State<'a> {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        if let Some(stats) = self
-            .metrics
-            .push(total_frame_delta, self.args.threshold, frame_start)
-        {
+        // Sample the WSI clock after present(). On DRM/KMS+Vulkan backends this
+        // is CLOCK_MONOTONIC nanoseconds from the presentation engine — the same
+        // domain as vblank timestamps. Computing deltas between consecutive samples
+        // gives inter-frame intervals that compositor scheduling (max_render_time,
+        // frame callbacks) cannot fabricate, because the clock ticks independently
+        // of any Wayland protocol messages.
+        //
+        // On backends that return is_invalid() (OpenGL, some Vulkan ICDs without
+        // VK_EXT_calibrated_timestamps) we fall back to CPU Instant deltas, which
+        // ARE schedulable. The `hw_verified` flag in TickStats exposes which path ran.
+        //
+        //FIXME: To get true, microsecond-accurate frame pacing, we need hardware-level presentation timestamps
+        // In Fifo the driver absorbs the vsync wait internally before returning from get_current_texture(), so our CPU timer is ~0ms.
+        // hardware timestamps would also improve Immediate/Mailbox precision.
+        // https://docs.rs/wgpu/latest/wgpu/struct.PresentationTimestamp.html
+        let wsi_delta_ms: Option<f32> = {
+            let ts = self.adapter.get_presentation_timestamp();
+            if ts.is_invalid() {
+                self.last_pres_ts = None;
+                None
+            } else {
+                let now_ns = ts.0 as u64;
+                let delta = self.last_pres_ts.map(|prev| {
+                    // nanoseconds → milliseconds; saturating_sub guards against
+                    // monotonic clock resets on suspend/resume cycles.
+                    now_ns.saturating_sub(prev) as f32 / 1_000_000.0
+                });
+                self.last_pres_ts = Some(now_ns);
+                delta.filter(|&ms| ms > 0.0 && ms < 1000.0)
+            }
+        };
+
+        let presentation_ts: Option<u64> = self.last_pres_ts.filter(|_| wsi_delta_ms.is_some());
+
+        if let Some(stats) = self.metrics.push(
+            total_frame_delta,
+            self.args.threshold,
+            frame_start,
+            presentation_ts,
+        ) {
             write_csv_row(&mut self.csv_file, &stats);
             write_json_row(&mut self.json_file, &stats);
 
