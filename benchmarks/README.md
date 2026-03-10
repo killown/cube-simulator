@@ -12,14 +12,24 @@ Performance analysis of the Cube Simulator using different Vulkan presentation m
 - **Architecture:** RADV GFX1200
 - **Driver:** Mesa 26.1.0-devel (RADV)
 - **Vulkan API:** 1.4.344
+- **RAM:** 32GB DDR4 @ 3200 MT/s
+  - **Configuration:** Asymmetric Flex Mode (8GB + 8GB + 16GB)
+  - **Note:** First 24GB operates in dual-channel; remaining 8GB in single-channel.
+- **CPU:** [AMD Ryzen 5 5600X 6-Core]
 
-### Software Layers
+### Display Topology (Test Target)
 
-- **OS:** Linux
-- **Key Layers:**
-  - `VK_LAYER_MESA_anti_lag`
-  - `VK_LAYER_MANGOHUD_overlay`
-  - `VK_LAYER_FROG_gamescope_wsi`
+- **Output:** HDMI-A-1
+- **Resolution:** 1920x1080 @ 165Hz
+- **Adaptive Sync:** Enabled (VRR Active)
+
+### Software & Layers
+
+- **OS:** Linux (Wayland)
+- **Active Layers:**
+  - `VK_LAYER_MESA_anti_lag`: Reduces input-to-display latency.
+  - `VK_LAYER_MANGOHUD_overlay`: Performance monitoring.
+  - `VK_LAYER_FROG_gamescope_wsi`: Optimized Wayland swapchain handling.
 
 ---
 
@@ -29,7 +39,20 @@ The benchmarks were executed under the following strict conditions to ensure dat
 
 - **Duration:** 1 minute per run (`timeout 1m`).
 - **Workload:** 90 cubes (`-c 90`).
-- **Comparison:** Identical workloads applied to both **FIFO** (VSync enabled) and **Mailbox** (Triple Buffering/No Tear) presentation modes.
+- **Data Capture:** Metrics sampled every 500ms.
+- **Storage:** Every run generates a data file (`.csv` or `.json`) and a paired `-info.txt` file containing the command string, system stats, and hardware state at execution time.
+- **Comparison:** Identical workloads applied to **FIFO** (Standard VSync) and **Mailbox** (Triple Buffering) to measure compositor back-pressure and frame pacing across different environments.
+
+---
+
+## Key Metrics Tracked
+
+| Metric     | Description                  | Benchmark Significance                               |
+| :--------- | :--------------------------- | :--------------------------------------------------- |
+| **FPS**    | Average Frames Per Second    | Raw throughput capability.                           |
+| **LOW_1**  | 1% Low FPS                   | Identifies micro-stutter and cache-miss hits.        |
+| **JITTER** | Frame-to-frame variance (ms) | Measures the "smoothness" of frame delivery.         |
+| **FTV**    | Frame Time Variance %        | Ratio of stddev to mean; indicates pacing stability. |
 
 ---
 
@@ -37,14 +60,7 @@ The benchmarks were executed under the following strict conditions to ensure dat
 
 Detailed frame timing and jitter data can be found in the following reports:
 
-- **[FIFO Benchmarks](./compositor-benchmarks-fifo.md):** Best for consistent frame pacing and power efficiency.
-- **[Mailbox Benchmarks](./compositor-benchmarks-mailbox.md):** Best for lowest latency without screen tearing.
+- **[FIFO Benchmarks](./compositor-benchmarks-fifo.md):** Analysis of monitor-synchronized pacing (165Hz target).
+- **[Mailbox Benchmarks](./compositor-benchmarks-mailbox.md):** Triple-buffering analysis focusing on uncapped internal framerates.
 
 ---
-
-## Key Metrics Tracked
-
-- **FPS:** Average frames per second.
-- **LOW_1:** 1% Lows (Crucial for identifying stutter).
-- **JITTER:** Variance in frame delivery times.
-- **FTV:** Frame Time Variance.

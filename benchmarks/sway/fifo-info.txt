@@ -1,0 +1,5 @@
+Command: target/release/frame-test -c 120 -m fifo --csv /home/neo/Git/cube-simulator/benchmarks/sway/fifo.csv
+HDMI-A-1: 1920x1080 @ 165Hz (VRR: On)
+Max Render time: 1
+Surface Format: Bgra8UnormSrgb
+Present Mode: Fifo
