@@ -5,7 +5,7 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::args::Args;
-use crate::metrics::{FrameMetrics, write_csv_row};
+use crate::metrics::{FrameMetrics, write_csv_row, write_json_row};
 use crate::uniforms::{ShaderUniforms, UniformBinding};
 
 /// Full GPU rendering state for one window.
@@ -25,6 +25,7 @@ pub struct State<'a> {
     last_frame_time: std::time::Instant,
     metrics: FrameMetrics,
     csv_file: Option<File>,
+    json_file: Option<File>,
     args: Args,
 }
 
@@ -94,6 +95,14 @@ impl<'a> State<'a> {
                 .unwrap();
             let _ = writeln!(f, "FPS,MIN,MAX,LOW_1,JITTER,DROPPED,FTV");
             f
+        });
+
+        let json_file = args.json.as_ref().map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
         });
 
         let initial_uniforms = ShaderUniforms::from_args(&args);
@@ -166,6 +175,7 @@ impl<'a> State<'a> {
             last_frame_time: now,
             metrics: FrameMetrics::new(frame_budget_ms),
             csv_file,
+            json_file,
             args,
         }
     }
@@ -218,6 +228,7 @@ impl<'a> State<'a> {
             .push(total_frame_delta, self.args.threshold, frame_start)
         {
             write_csv_row(&mut self.csv_file, &stats);
+            write_json_row(&mut self.json_file, &stats);
 
             let uniforms = ShaderUniforms::with_metrics(
                 &self.args,

@@ -25,4 +25,6 @@ pub struct Args {
     pub steps: u32,
     #[arg(long)]
     pub csv: Option<String>,
+    #[arg(long)]
+    pub json: Option<String>,
 }

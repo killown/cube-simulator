@@ -35,6 +35,7 @@ To get accurate metrics, you must compile with the release profile to minimize C
 | `--green`         | Green color component (0.0 to 1.0).                                                               | 0.8              |
 | `--blue`          | Blue color component (0.0 to 1.0).                                                                | 0.2              |
 | `--csv`           | Optional path to write metrics as CSV for offline analysis (e.g., `--csv out.csv`).               | None             |
+| `--json`          | Optional path to write metrics as NDJSON for offline analysis (e.g., `--json out.json`).          | None             |
 
 ### Present Mode Diagnostics
 

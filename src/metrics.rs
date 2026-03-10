@@ -174,3 +174,23 @@ pub fn write_csv_row(file: &mut Option<File>, stats: &TickStats) {
         );
     }
 }
+
+/// Writes one NDJSON line for a completed tick, if a file handle is present.
+///
+/// Each line is a self-contained JSON object so the file is streamable and
+/// appendable without wrapping in an array. Field names mirror the CSV header.
+pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
+    if let Some(f) = file {
+        let _ = writeln!(
+            f,
+            r#"{{"fps":{:.2},"min":{:.2},"max":{:.2},"low_1":{:.2},"jitter":{:.4},"dropped":{},"ftv":{:.2}}}"#,
+            stats.current_fps,
+            stats.min_fps,
+            stats.max_fps,
+            stats.low_1_fps,
+            stats.jitter,
+            stats.dropped_frames,
+            stats.ftv,
+        );
+    }
+}
