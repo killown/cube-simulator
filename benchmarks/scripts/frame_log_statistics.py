@@ -171,7 +171,6 @@ def _detect_stutter_events(
     if not anomaly_indices:
         return []
 
-    # Merge nearby anomalies into clusters.
     clusters: list[list[int]] = []
     current_cluster = [anomaly_indices[0]]
     for idx in anomaly_indices[1:]:
@@ -315,7 +314,101 @@ def _verdict(multiplier: float, jitter: float, avg_sync: float) -> str:
     return "ACCEPTABLE. Standard presentation timing."
 
 
-def analyze_frame_log(file_path: str) -> None:
+def _print_markdown_report(
+    file_path: str,
+    frames: list[dict],
+    ideal: float,
+    target_hz: float,
+    avg_delta: float,
+    jitter: float,
+    avg_sync: float,
+    avg_drift: float,
+    max_drift: float,
+    drift_stdev: float,
+    multiplier: float,
+    stutter_events: list[StutterEvent],
+    phases: list[SessionPhase],
+) -> None:
+    """Prints the telemetry report formatted as Markdown."""
+    duration_s = sum(f["delta_ms"] for f in frames) / 1000.0
+
+    print(f"# Telemetry Report: `{os.path.basename(file_path)}`\n")
+    print(f"- **Target:** {target_hz:.1f} Hz ({ideal:.4f} ms/frame)")
+    print(f"- **Frames Analysed:** {len(frames)}")
+    print(f"- **Session Duration:** {duration_s:.2f} s\n")
+
+    print("## Global Pacing\n")
+    print("| Metric | Value | Evaluation |")
+    print("|---|---|---|")
+    print(
+        f"| Avg Delivery Time | {avg_delta:.4f} ms | {_performance_label(multiplier)} |"
+    )
+    print(f"| V-Sync Multiplier | {multiplier:.2f} x | |")
+    print(f"| Jitter (IFI delta) | {jitter:.4f} ms | {_jitter_label(jitter)} |\n")
+
+    print("## Phase Drift\n")
+    print("| Metric | Value |")
+    print("|---|---|")
+    print(f"| Avg Phase Drift | {avg_drift:+.4f} ms |")
+    print(f"| Max Phase Drift | {max_drift:+.4f} ms |")
+    print(f"| Drift Std Dev | {drift_stdev:.4f} ms |")
+    print(f"| Avg Sync Score | {avg_sync:.2f} % |\n")
+
+    print("## Stutter Events\n")
+    if not stutter_events:
+        print("None detected.\n")
+    else:
+        total_vblanks_lost = sum(e.vblanks_missed for e in stutter_events)
+        total_anomalous = sum(e.cluster_size for e in stutter_events)
+        session_pct = 100 * total_anomalous / len(frames)
+
+        print(f"- **Distinct events:** {len(stutter_events)}")
+        print(
+            f"- **Anomalous frames:** {total_anomalous} ({session_pct:.2f}% of session)"
+        )
+        print(f"- **Vblanks lost:** {total_vblanks_lost}\n")
+
+        print("| IDX | WORST Δ | SZ | MISSED | SEVERITY | RECOV. JITTER |")
+        print("|---|---|---|---|---|---|")
+        for e in stutter_events:
+            rj = (
+                f"{e.recovery_jitter:.4f} ms"
+                if e.recovery_jitter is not None
+                else "n/a"
+            )
+            slip_marker = "~" if e.fractional_slip else ""
+            print(
+                f"| {e.frame_index} | {slip_marker}{e.delta_ms:.4f} ms | "
+                f"{e.cluster_size} | {e.vblanks_missed} | {e.severity} | {rj} |"
+            )
+        print(
+            "\n> `~` = fractional vblank slip (1.25×–2× ideal, no whole vblank missed)\n"
+        )
+
+    if len(phases) > 1:
+        print("## Session Phases\n")
+        print("*Cadence regimes, keyed on global frame index*\n")
+        print("| # | GLOBAL IDX | MEAN Δ | EFF. Hz | JITTER |")
+        print("|---|---|---|---|---|")
+        for idx, ph in enumerate(phases, 1):
+            frame_range = f"{ph.start_frame}–{ph.end_frame}"
+            print(
+                f"| {idx} | {frame_range} | {ph.mean_delta:.4f} ms | "
+                f"{ph.effective_hz:.1f} Hz | {ph.jitter:.4f} ms |"
+            )
+        print()
+
+    print("## Verdict\n")
+    verdict_lines = _verdict(multiplier, jitter, avg_sync).split("\n")
+    print(f"**{verdict_lines[0]}**\n")
+    if len(verdict_lines) > 1:
+        for line in verdict_lines[1:]:
+            if line.strip():
+                print(f"> {line.strip()}")
+        print()
+
+
+def analyze_frame_log(file_path: str, markdown: bool = False) -> None:
     """Prints a telemetry report for a frame log produced by the wgpu benchmark.
 
     Covers global pacing stats, clustered stutter events with recovery
@@ -345,6 +438,24 @@ def analyze_frame_log(file_path: str) -> None:
 
     stutter_events = _detect_stutter_events(frames, ideal)
     phases = _segment_phases(frames, ideal)
+
+    if markdown:
+        _print_markdown_report(
+            file_path,
+            frames,
+            ideal,
+            target_hz,
+            avg_delta,
+            jitter,
+            avg_sync,
+            avg_drift,
+            max_drift,
+            drift_stdev,
+            multiplier,
+            stutter_events,
+            phases,
+        )
+        return
 
     W = 70
     sep = "─" * W
@@ -428,7 +539,13 @@ def analyze_frame_log(file_path: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python analyze.py <frame_log.json>")
+    args = sys.argv[1:]
+    use_md = "--markdown" in args
+    if use_md:
+        args.remove("--markdown")
+
+    if not args:
+        print("Usage: python analyze.py <frame_log.json> [--markdown]")
         sys.exit(1)
-    analyze_frame_log(sys.argv[1])
+
+    analyze_frame_log(args[0], markdown=use_md)
