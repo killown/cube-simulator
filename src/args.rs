@@ -9,11 +9,11 @@ pub struct Args {
     pub size: f32,
     #[arg(short, long, default_value_t = 1.0)]
     pub speed: f32,
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.18)]
     pub red: f32,
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.18)]
     pub green: f32,
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(long, default_value_t = 0.18)]
     pub blue: f32,
     #[arg(short = 't', long, default_value_t = 25.0)]
     pub threshold: f32,

@@ -41,6 +41,7 @@ pub struct State<'a> {
     /// when the backend returns invalid presentation timestamps.
     frame_log_file: Option<File>,
     args: Args,
+    current_uniforms: ShaderUniforms,
 }
 
 impl<'a> State<'a> {
@@ -77,10 +78,9 @@ impl<'a> State<'a> {
             .unwrap_or(1000.0 / 60.0);
 
         println!(
-            "Frame Budget: {:.4}ms ({:.2}Hz)  [source: {}]",
+            "Frame Budget: {:.4}ms ({:.2}Hz)  ",
             frame_budget_ms,
             1000.0 / frame_budget_ms,
-            args.connector.as_deref().unwrap_or("winit fallback"),
         );
 
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
@@ -204,7 +204,7 @@ impl<'a> State<'a> {
             Some(f)
         });
 
-        let initial_uniforms = ShaderUniforms::from_args(&args);
+        let initial_uniforms = ShaderUniforms::from_args(&args, args.cubes);
         let uniform_binding = UniformBinding::new(&device, &initial_uniforms);
 
         let config = wgpu::SurfaceConfiguration {
@@ -280,6 +280,7 @@ impl<'a> State<'a> {
             json_file,
             frame_log_file,
             args,
+            current_uniforms: initial_uniforms,
         }
     }
 
@@ -293,6 +294,11 @@ impl<'a> State<'a> {
             * 1000.0;
         self.last_frame_time = frame_start;
 
+        // Write time in one upload before acquire.
+        self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
+        self.uniform_binding
+            .write(&self.queue, &self.current_uniforms);
+
         // Measure JIT/Back-pressure: How long does the swapchain block us?
         let output = self.surface.get_current_texture()?;
 
@@ -302,7 +308,6 @@ impl<'a> State<'a> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let packed = self.start_time.elapsed().as_millis() as u32;
 
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -320,7 +325,7 @@ impl<'a> State<'a> {
             });
             rpass.set_pipeline(&self.render_pipeline);
             rpass.set_bind_group(0, &self.uniform_binding.bind_group, &[]);
-            rpass.draw(0..4, packed..(packed + 1));
+            rpass.draw(0..4, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -377,8 +382,9 @@ impl<'a> State<'a> {
             write_csv_row(&mut self.csv_file, &stats);
             write_json_row(&mut self.json_file, &stats);
 
-            let uniforms = ShaderUniforms::with_metrics(
+            self.current_uniforms = ShaderUniforms::with_metrics(
                 &self.args,
+                self.args.cubes,
                 stats.current_fps,
                 stats.min_fps,
                 stats.max_fps,
@@ -386,8 +392,10 @@ impl<'a> State<'a> {
                 stats.jitter,
                 stats.dropped_frames,
                 stats.ftv,
+                self.start_time.elapsed().as_secs_f32(),
             );
-            self.uniform_binding.write(&self.queue, &uniforms);
+            self.uniform_binding
+                .write(&self.queue, &self.current_uniforms);
         }
 
         Ok(())
