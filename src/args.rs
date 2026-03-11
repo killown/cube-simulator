@@ -27,4 +27,10 @@ pub struct Args {
     pub csv: Option<String>,
     #[arg(long)]
     pub json: Option<String>,
+    #[arg(long)]
+    pub frame_log: Option<String>,
+    /// DRM connector to read the refresh rate from (e.g. `DP-1`, `HDMI-A-1`).
+    /// Run without this flag to print all active connectors and their modes.
+    #[arg(long)]
+    pub connector: Option<String>,
 }

@@ -140,7 +140,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     d = max(d, max(sd_char(r3, 4687), max(sd_char(r3 - vec2(4.0, 0.0), 31599), sd_char(r3 - vec2(8.0, 0.0), 23418))));
     d = max(d, draw_num(r3 - vec2(14.0, 0.0), i32(u.fps_data.w)));
 
-    // Row 4: JIT  (J=26926, I=29847, T=29842)
+    // Row 4: JIT  (J=26926, I=29847, T=29842) — units: hundredths-of-ms (val/100 = ms)
     let r4 = base_uv - vec2(0.0, 24.0);
     d = max(d, max(sd_char(r4, 26926), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
     d = max(d, draw_num(r4 - vec2(14.0, 0.0), i32(u.adv_data.x)));
@@ -150,13 +150,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     d = max(d, max(sd_char(r5, 24429), max(sd_char(r5 - vec2(4.0, 0.0), 29671), sd_char(r5 - vec2(8.0, 0.0), 15211))));
     d = max(d, draw_num(r5 - vec2(14.0, 0.0), i32(u.adv_data.y)));
 
-    // Row 6: FTV  (F=29385, T=29842, V=23378)
-    // Frame Time Variance %: stddev/mean*100 over the rolling window.
-    // 0% = all frames equally spaced, high % = frames bunching and
-    // skipping — visually skippy even if mean FPS looks acceptable.
+    // Row 6: FTV  (F=29385, T=29842, V=23378) — units: tenths-of-% (val/10 = %)
+    // Frame Time Variance: stddev/mean×100 over the rolling window, scaled ×10.
+    // 0 = perfectly uniform cadence; high = frames bunching and skipping.
     let r6 = base_uv - vec2(0.0, 36.0);
     d = max(d, max(sd_char(r6, 29385), max(sd_char(r6 - vec2(4.0, 0.0), 29842), sd_char(r6 - vec2(8.0, 0.0), 23378))));
     d = max(d, draw_num(r6 - vec2(14.0, 0.0), i32(u.adv_data.z)));
 
     return vec4(mix(color, vec3(0.0, 1.0, 0.5), d), 1.0);
 }
+

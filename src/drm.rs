@@ -17,6 +17,7 @@ impl Device for Card {}
 impl ControlDevice for Card {}
 
 /// The single mode the CRTC is currently programmed to.
+#[derive(Clone)]
 pub struct ActiveMode {
     pub width: u16,
     pub height: u16,
@@ -24,6 +25,7 @@ pub struct ActiveMode {
 }
 
 /// Discovered properties of one display output.
+#[derive(Clone)]
 pub struct ConnectorInfo {
     pub name: String,
     pub active_mode: Option<ActiveMode>,
@@ -31,6 +33,7 @@ pub struct ConnectorInfo {
 }
 
 /// Full snapshot of DRM topology at the moment of the call.
+#[derive(Clone)]
 pub struct DrmInfo {
     pub connectors: Vec<ConnectorInfo>,
 }
@@ -50,6 +53,16 @@ impl DrmInfo {
                 );
             }
         }
+    }
+
+    /// Returns the refresh rate of the named connector, or `None` if not found
+    /// or the connector has no active mode.
+    pub fn find_refresh_hz(&self, name: &str) -> Option<u32> {
+        self.connectors
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .and_then(|c| c.active_mode.as_ref())
+            .map(|m| m.refresh_hz)
     }
 }
 

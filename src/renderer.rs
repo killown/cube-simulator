@@ -5,7 +5,9 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::args::Args;
-use crate::metrics::{FrameMetrics, write_csv_row, write_json_row};
+use crate::metrics::{
+    FrameMetrics, PacingAnalyzer, write_csv_row, write_frame_log_row, write_json_row,
+};
 use crate::uniforms::{ShaderUniforms, UniformBinding};
 
 /// Full GPU rendering state for one window.
@@ -30,8 +32,14 @@ pub struct State<'a> {
     /// nanosecond clock, which `max_render_time` cannot shift.
     last_pres_ts: Option<u64>,
     metrics: FrameMetrics,
+    /// Phase-locked pacing analyzer fed every frame before the 500ms tick gate,
+    /// so every individual frame's drift and sync score are captured.
+    pacing: PacingAnalyzer,
     csv_file: Option<File>,
     json_file: Option<File>,
+    /// Per-frame NDJSON pacing log; `None` when `--frame-log` is not passed or
+    /// when the backend returns invalid presentation timestamps.
+    frame_log_file: Option<File>,
     args: Args,
 }
 
@@ -41,23 +49,38 @@ impl<'a> State<'a> {
     ///
     /// Exits the process with a diagnostic message if the requested `--format`
     /// or `--mode` is not supported by the adapter.
-    pub async fn new(window: Arc<Window>, args: Args) -> State<'a> {
+    pub async fn new(
+        window: Arc<Window>,
+        args: Args,
+        drm_info: Option<crate::drm::DrmInfo>,
+    ) -> State<'a> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let frame_budget_ms = window
-            .current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-            .map(|mhz| 1_000_000.0 / mhz as f32) // millihertz → ms per frame
-            .unwrap_or(16.666);
+        // Connector-pinned refresh rate is the only reliable source on multi-monitor
+        // setups. winit asks the compositor, which may report a virtual 60Hz rate
+        // even on a 165Hz panel. DRM talks directly to KMS and is always correct.
+        let frame_budget_ms = args
+            .connector
+            .as_deref()
+            .and_then(|name| drm_info.as_ref()?.find_refresh_hz(name))
+            .map(|hz| 1000.0 / hz as f32)
+            .or_else(|| {
+                window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|mhz| 1_000_000.0 / mhz as f32)
+            })
+            .unwrap_or(1000.0 / 60.0);
 
         println!(
-            "Frame Budget: {:.3}ms ({:.1}Hz)",
+            "Frame Budget: {:.4}ms ({:.2}Hz)  [source: {}]",
             frame_budget_ms,
-            1000.0 / frame_budget_ms
+            1000.0 / frame_budget_ms,
+            args.connector.as_deref().unwrap_or("winit fallback"),
         );
 
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
@@ -96,17 +119,19 @@ impl<'a> State<'a> {
         // Warn once if the backend does not support WSI-domain timestamps.
         // In that case jitter/FTV fall back to CPU Instant deltas, which are
         // schedulable by compositor tricks such as max_render_time.
-        {
+        let hw_timestamps_available = {
             let ts = adapter.get_presentation_timestamp();
             if ts.is_invalid() {
                 eprintln!(
                     "WARN: Backend does not support presentation timestamps — \
                      jitter/FTV will use CPU timers (compositor-schedulable)"
                 );
+                false
             } else {
                 println!("Presentation timestamps: available (WSI-domain, compositor-resistant)");
+                true
             }
-        }
+        };
 
         let cmd_line = std::env::args().collect::<Vec<_>>().join(" ");
         let mut raw_header = format!("Command: {}\n", cmd_line);
@@ -157,6 +182,26 @@ impl<'a> State<'a> {
                 .append(true)
                 .open(path)
                 .unwrap()
+        });
+
+        // Only open the frame log when the backend can supply hardware timestamps;
+        // silently skip it otherwise to avoid writing a file full of CPU-derived
+        // data that would be misleading under the per-frame pacing contract.
+        let frame_log_file = args.frame_log.as_ref().and_then(|path| {
+            if !hw_timestamps_available {
+                eprintln!(
+                    "WARN: --frame-log requested but backend has no HW timestamps — skipping"
+                );
+                return None;
+            }
+            write_info(path, &raw_header);
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            let _ = writeln!(f, "# frame,ts_ns,delta_ms,ideal_ms,drift_ms,sync");
+            Some(f)
         });
 
         let initial_uniforms = ShaderUniforms::from_args(&args);
@@ -230,8 +275,10 @@ impl<'a> State<'a> {
             last_frame_time: now,
             last_pres_ts: None,
             metrics: FrameMetrics::new(frame_budget_ms),
+            pacing: PacingAnalyzer::new(frame_budget_ms),
             csv_file,
             json_file,
+            frame_log_file,
             args,
         }
     }
@@ -307,6 +354,14 @@ impl<'a> State<'a> {
                     now_ns.saturating_sub(prev) as f32 / 1_000_000.0
                 });
                 self.last_pres_ts = Some(now_ns);
+
+                // Feed the raw timestamp into the pacing analyzer before the
+                // 500ms tick gate so every individual frame's phase drift and
+                // sync score are captured and logged at full frame resolution.
+                if let Some(record) = self.pacing.push(now_ns) {
+                    write_frame_log_row(&mut self.frame_log_file, &record);
+                }
+
                 delta.filter(|&ms| ms > 0.0 && ms < 1000.0)
             }
         };

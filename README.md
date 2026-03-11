@@ -22,22 +22,36 @@ To get accurate metrics, you must compile with the release profile to minimize C
 
 ### CLI Parameters
 
-| Argument          | Description                                                                                       | Default          |
-| :---------------- | :------------------------------------------------------------------------------------------------ | :--------------- |
-| `-c, --cubes`     | Number of hollow cubes to march.                                                                  | 6                |
-| `-s, --size`      | Radius/Scale of the objects.                                                                      | 0.5              |
-| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames).                                              | 25.0             |
-| `-f, --format`    | Force a specific `wgpu::TextureFormat` (e.g., `Rgba8Unorm`). Prints available options if invalid. | None             |
-| `-m, --mode`      | Force a specific `wgpu::PresentMode` (`mailbox`, `immediate`, `fifo`).                            | `mailbox` (auto) |
-| `--steps`         | Maximum raymarching steps per fragment. Higher values increase GPU load.                          | 80               |
-| `--speed`         | Multiplier for rotation and oscillation.                                                          | 1.0              |
-| `--red`           | Red color component (0.0 to 1.0).                                                                 | 0.5              |
-| `--green`         | Green color component (0.0 to 1.0).                                                               | 0.8              |
-| `--blue`          | Blue color component (0.0 to 1.0).                                                                | 0.2              |
-| `--csv`           | Optional path to write metrics as CSV for offline analysis (e.g., `--csv out.csv`).               | None             |
-| `--json`          | Optional path to write metrics as NDJSON for offline analysis (e.g., `--json out.json`).          | None             |
+| Argument          | Description                                                                  | Default          |
+| :---------------- | :--------------------------------------------------------------------------- | :--------------- |
+| `-c, --cubes`     | Number of hollow cubes to march.                                             | 6                |
+| `-z, --size`      | Radius/Scale of the objects.                                                 | 0.5              |
+| `-s, --speed`     | Multiplier for rotation and oscillation.                                     | 1.0              |
+| `--red`           | Red color component (0.0 to 1.0).                                            | 0.5              |
+| `--green`         | Green color component (0.0 to 1.0).                                          | 0.8              |
+| `--blue`          | Blue color component (0.0 to 1.0).                                           | 0.2              |
+| `-t, --threshold` | Frame-time delta limit (ms) for MSD (Missed Frames).                         | 25.0             |
+| `-f, --format`    | Force a specific `wgpu::TextureFormat`. Prints available options if invalid. | None             |
+| `-m, --mode`      | Force a specific `wgpu::PresentMode` (`mailbox`, `immediate`, `fifo`).       | `mailbox` (auto) |
+| `--steps`         | Maximum raymarching steps per fragment. Higher values increase GPU load.     | 80               |
+| `--connector`     | DRM connector name (e.g. `DP-1`). Auto-selects if only one is active.        | Auto             |
+| `--frame-log`     | Path to write high-res per-frame hardware telemetry (NDJSON).                | None             |
+| `--csv`           | Path to write rolling window metrics as CSV.                                 | None             |
+| `--json`          | Path to write rolling window metrics as NDJSON.                              | None             |
 
-> **`TS_SOURCE` column** (CSV/JSON output only): Each row includes a `TS_SOURCE` field set to either `hw` or `cpu`. `hw` means jitter and FTV for that window were computed from WSI-domain KMS flip timestamps (compositor-resistant). `cpu` means the backend returned an invalid presentation timestamp and the metrics fell back to CPU-side `Instant` deltas, which are subject to compositor scheduling (e.g. `max_render_time` on Mailbox). Treat `cpu`-sourced jitter/FTV as approximate.
+---
+
+> **`TS_SOURCE` column** (CSV/JSON output only): Each row includes a `TS_SOURCE` field set to either `hw` or `cpu`. `hw` means jitter and FTV for that window were computed from WSI-domain KMS flip timestamps (compositor-resistant). `cpu` means the backend returned an invalid presentation timestamp and the metrics fell back to CPU-side `Instant` deltas.
+
+### Low-Level Telemetry (`--frame-log`)
+
+The `.json` frame log provides microsecond-resolution insight for every scanout event using kernel-level timestamps (`CLOCK_MONOTONIC`). This bypasses compositor scheduling to reveal true hardware pacing:
+
+- **ts_ns:** Raw hardware presentation timestamp in nanoseconds. This is the exact moment the display hardware (KMS) finished the page flip.
+- **delta_ms:** Actual time elapsed between physical display updates.
+- **ideal_ms:** The target interval based on the monitor's physical hardware refresh rate (e.g., 6.06ms for 165Hz).
+- **drift_ms:** Signed deviation from the nearest vblank boundary (+ is late, - is early).
+- **sync:** Quality score (0-100). **100** means the frame landed exactly on a vblank pulse.
 
 ### Present Mode Diagnostics
 
@@ -123,13 +137,6 @@ target/release/frame-test
   A value near **0%** means all frames took approximately the same time perfectly uniform delivery. A high value means frame times are spread widely: some frames complete in a few milliseconds while others take tens of milliseconds. Even if the mean FPS looks acceptable, this imbalance causes frames to bunch together and then stall, which the eye perceives as judder or skipping.
 
   > **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
-
-  > **Note:** When `TS_SOURCE` is `hw`, FTV and JIT are derived from WSI-domain KMS flip timestamps and are compositor-resistant. When `TS_SOURCE` is `cpu`, they fall back to CPU-side `Instant` deltas, which are valid across all Wayland compositors but can be deflated by compositor scheduling (e.g. `max_render_time` on Mailbox present mode).
-
-- **TS_SOURCE (Timestamp Source)**
-  Indicates the clock domain used to compute jitter and FTV for each 500ms reporting window. `hw` means metrics were derived from hardware presentation timestamps returned by the WSI (Window System Integration) layer — on Vulkan/DRM backends these map directly to `CLOCK_MONOTONIC` KMS flip events and cannot be fabricated by the compositor. `cpu` means the WSI backend returned an invalid timestamp (common on OpenGL, XWayland, and some Vulkan ICDs without `VK_EXT_calibrated_timestamps`) and the metrics fell back to CPU `Instant` deltas. In `cpu` mode on Mailbox, compositor features such as `max_render_time` can make jitter and FTV appear artificially low.
-
----
 
 ### Performance Note: Why Raymarching?
 

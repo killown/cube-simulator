@@ -1,4 +1,3 @@
-// metrics.rs
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
@@ -32,6 +31,112 @@ pub struct TickStats {
     /// CPU-side `Instant` deltas. When `false`, `max_render_time` on a Mailbox
     /// compositor can artificially deflate these values.
     pub hw_verified: bool,
+}
+
+/// A single frame's pacing record derived from hardware presentation timestamps.
+///
+/// Captures the exact moment a frame was scanned out by the display engine,
+/// how far it drifted from its ideal vblank slot, and a normalised sync score.
+#[derive(Debug, Clone, Copy)]
+pub struct FramePacingRecord {
+    /// Absolute KMS/WSI presentation timestamp of this frame (nanoseconds).
+    pub timestamp_ns: u64,
+    /// Measured inter-frame interval for this frame (milliseconds).
+    pub delta_ms: f32,
+    /// Target vblank period derived from the monitor's refresh rate (milliseconds).
+    pub ideal_ms: f32,
+    /// Signed deviation from the nearest ideal vblank boundary (milliseconds).
+    ///
+    /// Positive = frame arrived late (missed its slot, presented on next vblank).
+    /// Negative = frame arrived early (unlikely on vsync'd paths; possible on Immediate).
+    /// The magnitude is clamped to `ideal_ms / 2` so it always represents the
+    /// closest boundary, not an accumulated offset.
+    pub phase_drift_ms: f32,
+    /// Normalised frame sync quality: 100 = perfectly on-vblank, 0 = half-period drift.
+    ///
+    /// Computed as `100 × (1 − |phase_drift| / (ideal_ms / 2))`, clamped to `[0, 100]`.
+    /// A score ≥ 95 is considered perceptually indistinguishable from perfect pacing.
+    pub sync_score: f32,
+    /// Frame sequence number since the analyzer was created (0-based).
+    pub frame_index: u64,
+}
+
+/// Stateful per-frame pacing analyzer driven by hardware presentation timestamps.
+///
+/// Maintains a phase accumulator so drift is always measured against the *nearest*
+/// ideal vblank boundary rather than an absolute origin, which remains meaningful
+/// even after monitor blanking, VT switches, or DPMS wakeups.
+pub struct PacingAnalyzer {
+    /// Vblank period in nanoseconds, derived from the monitor's refresh rate.
+    ideal_period_ns: u64,
+    /// The presentation timestamp of the first valid frame, used as the phase origin.
+    phase_origin_ns: Option<u64>,
+    /// Previous valid presentation timestamp for delta computation.
+    prev_ts_ns: Option<u64>,
+    /// Monotonically increasing frame counter.
+    frame_index: u64,
+}
+
+impl PacingAnalyzer {
+    /// Creates a new analyzer calibrated to the monitor's refresh rate.
+    ///
+    /// `frame_budget_ms` is the reciprocal of the refresh rate in milliseconds
+    /// (e.g. `16.666` for 60 Hz, `8.333` for 120 Hz). This is used to derive
+    /// the ideal vblank period in nanoseconds for phase drift calculations.
+    pub fn new(frame_budget_ms: f32) -> Self {
+        Self {
+            ideal_period_ns: (frame_budget_ms * 1_000_000.0).round() as u64,
+            phase_origin_ns: None,
+            prev_ts_ns: None,
+            frame_index: 0,
+        }
+    }
+
+    /// Ingests one hardware presentation timestamp and returns a pacing record.
+    ///
+    /// Returns `None` for the very first frame (no delta available yet) or when
+    /// the delta is outside the plausible range `(0, 1000ms)` — which indicates
+    /// a clock discontinuity (suspend/resume, VT switch).
+    ///
+    /// # Arguments
+    /// * `ts_ns` — Raw KMS/WSI nanosecond timestamp from the presentation engine.
+    pub fn push(&mut self, ts_ns: u64) -> Option<FramePacingRecord> {
+        let idx = self.frame_index;
+        self.frame_index += 1;
+
+        let prev = self.prev_ts_ns.replace(ts_ns)?;
+
+        let delta_ns = ts_ns.saturating_sub(prev);
+        let delta_ms = delta_ns as f32 / 1_000_000.0;
+
+        if delta_ms <= 0.0 || delta_ms >= 1000.0 {
+            self.phase_origin_ns = None;
+            return None;
+        }
+
+        let origin = *self.phase_origin_ns.get_or_insert(ts_ns);
+
+        // Distance of this timestamp from the phase origin in vblank periods.
+        let elapsed_ns = ts_ns.saturating_sub(origin);
+        let nearest_vblank_count = (elapsed_ns as f64 / self.ideal_period_ns as f64).round() as u64;
+        let ideal_ts_ns = origin + nearest_vblank_count * self.ideal_period_ns;
+
+        // Signed drift: positive = late, negative = early.
+        let drift_ns = ts_ns as i64 - ideal_ts_ns as i64;
+        let drift_ms = drift_ns as f32 / 1_000_000.0;
+
+        let half_period_ms = self.ideal_period_ns as f32 / 2_000_000.0;
+        let sync_score = (100.0 * (1.0 - drift_ms.abs() / half_period_ms)).clamp(0.0, 100.0);
+
+        Some(FramePacingRecord {
+            timestamp_ns: ts_ns,
+            delta_ms,
+            ideal_ms: self.ideal_period_ns as f32 / 1_000_000.0,
+            phase_drift_ms: drift_ms,
+            sync_score,
+            frame_index: idx,
+        })
+    }
 }
 
 impl FrameMetrics {
@@ -274,6 +379,32 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
             stats.dropped_frames,
             stats.ftv,
             stats.hw_verified,
+        );
+    }
+}
+
+/// Writes one NDJSON line for a single frame's pacing record, if a file handle is present.
+///
+/// Emitted once per frame (not per tick), providing microsecond-resolution insight
+/// into how each individual frame landed relative to the ideal vblank grid.
+/// Fields:
+/// - `frame`: monotonic frame index since session start
+/// - `ts_ns`: raw hardware presentation timestamp (nanoseconds, CLOCK_MONOTONIC domain)
+/// - `delta_ms`: measured inter-frame interval
+/// - `ideal_ms`: target vblank period from monitor refresh rate
+/// - `drift_ms`: signed deviation from nearest vblank boundary (+ = late, − = early)
+/// - `sync`: 0–100 quality score (100 = perfectly on-vblank)
+pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord) {
+    if let Some(f) = file {
+        let _ = writeln!(
+            f,
+            r#"{{"frame":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"sync":{:.2}}}"#,
+            record.frame_index,
+            record.timestamp_ns,
+            record.delta_ms,
+            record.ideal_ms,
+            record.phase_drift_ms,
+            record.sync_score,
         );
     }
 }

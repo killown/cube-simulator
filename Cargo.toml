@@ -10,3 +10,5 @@ pollster = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 bytemuck = { version = "1.15", features = ["derive"] }
 drm = "0.14.2"
+drm-sys = "0.8.1"
+libc = "0.2.183"

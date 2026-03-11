@@ -8,6 +8,7 @@ use winit::{
 };
 
 use crate::args::Args;
+use crate::drm::DrmInfo;
 use crate::renderer::State;
 
 /// Top-level winit application container.
@@ -18,6 +19,7 @@ use crate::renderer::State;
 pub struct App<'a> {
     pub state: Option<State<'a>>,
     pub args: Args,
+    pub drm_info: Option<DrmInfo>,
 }
 
 impl<'a> ApplicationHandler for App<'a> {
@@ -25,7 +27,11 @@ impl<'a> ApplicationHandler for App<'a> {
         let attributes =
             WindowAttributes::default().with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = Arc::new(el.create_window(attributes).unwrap());
-        self.state = Some(pollster::block_on(State::new(window, self.args.clone())));
+        self.state = Some(pollster::block_on(State::new(
+            window,
+            self.args.clone(),
+            self.drm_info.take(),
+        )));
 
         println!(
             "\nMETRIC LEGEND:\n\
