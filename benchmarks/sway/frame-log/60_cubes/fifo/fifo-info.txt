@@ -1,0 +1,5 @@
+Command: /home/neo/Git/cube-simulator/target/release/frame-test -m fifo --frame-log fifo.json -c 60 --connector HDMI-A-1
+DP-1: 2560x1080 @ 75Hz (VRR: On)
+HDMI-A-1: 1920x1080 @ 165Hz (VRR: On)
+Surface Format: Bgra8UnormSrgb
+Present Mode: Fifo
