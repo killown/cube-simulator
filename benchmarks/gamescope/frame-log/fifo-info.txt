@@ -1,0 +1,5 @@
+Command: target/release/frame-test -m fifo --frame-log benchmarks/gamescope/frame-log/fifo.json -c 30 --connector HDMI-A-1 --red 0.18 --blue 0.18 --green 0.18
+DP-1: 2560x1080 @ 75Hz (VRR: Off)
+HDMI-A-1: 1920x1080 @ 165Hz (VRR: Off)
+Surface Format: Bgra8UnormSrgb
+Present Mode: Fifo
