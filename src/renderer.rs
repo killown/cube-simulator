@@ -42,6 +42,19 @@ pub struct State<'a> {
     frame_log_file: Option<File>,
     args: Args,
     current_uniforms: ShaderUniforms,
+    /// Per-frame decaying stutter intensity. Set to `1.0` when a frame is
+    /// detected as dropped or jitter exceeds the configured threshold;
+    /// decremented by `STUTTER_DECAY_RATE` each frame toward `0.0`.
+    stutter_decay: f32,
+    /// Exponential moving average of `vblank_mul` sampled each frame from
+    /// `FramePacingRecord`.  Tracks sustained delivery pressure: `1.0` = perfect
+    /// on-time delivery, `2.0` = every frame costs two vblanks.  The EMA
+    /// smooths over isolated spikes so only regime-level badness triggers yellow.
+    vblank_mul_ema: f32,
+    /// Decaying compositor-pressure indicator.  Set to `1.0` when
+    /// `vblank_mul_ema` exceeds the `PACING_EMA_THRESHOLD`; decays at
+    /// `PACING_DECAY_RATE` per frame when delivery recovers.
+    pacing_decay: f32,
 }
 
 impl<'a> State<'a> {
@@ -281,6 +294,9 @@ impl<'a> State<'a> {
             frame_log_file,
             args,
             current_uniforms: initial_uniforms,
+            stutter_decay: 0.0,
+            vblank_mul_ema: 1.0,
+            pacing_decay: 0.0,
         }
     }
 
@@ -294,8 +310,32 @@ impl<'a> State<'a> {
             * 1000.0;
         self.last_frame_time = frame_start;
 
+        // RED  (stutter_decay):  severe regime, EMA(vblank_mul) > 1.15.
+        //   Lingers ~45 frames so a bad run leaves a long-lasting red ghost.
+        const STUTTER_DECAY_RATE: f32 = 1.0 / 45.0;
+        // YELLOW (pacing_decay): per-frame warning, any single vblank_mul > 1.
+        //   Fades quickly (~30 frames) so it reads as a momentary ping, not an alarm.
+        const PACING_DECAY_RATE: f32 = 1.0 / 30.0;
+        // EMA smoothing: α=0.05 gives a ~19-frame half-life, long enough to
+        // ignore a single dropped frame but short enough to react to a bad run
+        // within ~60ms at 165 Hz.
+        const PACING_EMA_ALPHA: f32 = 0.05;
+        // Fire red once the rolling mean vblank cost exceeds 1.15×.
+        // 1.15 corresponds to roughly 1 dropped frame every 7 frames, a
+        // clearly degraded regime without penalising isolated one-off drops.
+        const PACING_EMA_THRESHOLD: f32 = 1.15;
+
+        // Decay both markers unconditionally; trigger paths only set them to 1.0.
+        // stutter_decay (red) is set in the HW pacing block below on EMA breach,
+        // or in the CPU fallback on threshold breach.
+        // pacing_decay (yellow) is set on any single vblank_mul > 1.
+        self.stutter_decay = (self.stutter_decay - STUTTER_DECAY_RATE).max(0.0);
+        self.pacing_decay = (self.pacing_decay - PACING_DECAY_RATE).max(0.0);
+
         // Write time in one upload before acquire.
         self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
+        self.current_uniforms.stutter_decay = self.stutter_decay;
+        self.current_uniforms.pacing_decay = self.pacing_decay;
         self.uniform_binding
             .write(&self.queue, &self.current_uniforms);
 
@@ -370,6 +410,11 @@ impl<'a> State<'a> {
             let ts = self.adapter.get_presentation_timestamp();
             if ts.is_invalid() {
                 self.last_pres_ts = None;
+                // No HW timestamps: threshold breach is the only coarse proxy available.
+                // Maps to red (severe) since a 25ms+ stall is always a hard hitch.
+                if total_frame_delta > self.args.threshold {
+                    self.stutter_decay = 1.0;
+                }
                 None
             } else {
                 let now_ns = ts.0 as u64;
@@ -385,6 +430,18 @@ impl<'a> State<'a> {
                 // sync score are captured and logged at full frame resolution.
                 if let Some(record) = self.pacing.push(now_ns, Some(cpu_frame_ms), cpu_submit_ns) {
                     write_frame_log_row(&mut self.frame_log_file, &record);
+
+                    // Any single missed vblank is a yellow warning, a momentary ping.
+                    if record.vblank_mul > 1 {
+                        self.pacing_decay = 1.0;
+                    }
+
+                    // EMA breach is the severe regime, fire red and let it linger.
+                    self.vblank_mul_ema = PACING_EMA_ALPHA * record.vblank_mul as f32
+                        + (1.0 - PACING_EMA_ALPHA) * self.vblank_mul_ema;
+                    if self.vblank_mul_ema > PACING_EMA_THRESHOLD {
+                        self.stutter_decay = 1.0;
+                    }
                 }
 
                 delta.filter(|&ms| ms > 0.0 && ms < 1000.0)
@@ -413,6 +470,8 @@ impl<'a> State<'a> {
                 stats.dropped_frames,
                 stats.ftv,
                 self.start_time.elapsed().as_secs_f32(),
+                self.stutter_decay,
+                self.pacing_decay,
             );
             self.uniform_binding
                 .write(&self.queue, &self.current_uniforms);

@@ -1,19 +1,19 @@
-// Cube simulator — original raymarcher with per-cube colour and unique inner shape.
+// Cube simulator, original raymarcher with per-cube colour and unique inner shape.
 // Inner shapes are resolved via a secondary march inside a confirmed cube hit,
 // keeping the primary SDF clean and stable.
 
 struct Uniforms {
-    color:      vec4<f32>,
-    cube_count: u32,
-    size:       f32,
-    speed:      f32,
-    steps:      u32,
-    fps_data:   vec4<f32>,
-    adv_data:   vec4<f32>,   // [jitter, dropped, ftv, _pad]
-    time:       f32,
-    _pad0:      f32,
-    _pad1:      f32,
-    _pad2:      f32,
+    color:         vec4<f32>,
+    cube_count:    u32,
+    size:          f32,
+    speed:         f32,
+    steps:         u32,
+    fps_data:      vec4<f32>,
+    adv_data:      vec4<f32>,   // [jitter, dropped, ftv, _pad]
+    time:          f32,
+    stutter_decay: f32,         // 1.0 on dropped frame,         decays ~30 frames
+    pacing_decay:  f32,         // EMA vblank_mul pressure,      decays ~45 frames
+    _pad:          f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -85,7 +85,7 @@ fn cube_local(p: vec3<f32>, fi: f32, t: f32) -> vec3<f32> {
     return q;
 }
 
-// ── Primary scene SDF — outer shell only, no inner shapes ────────────────────
+// ── Primary scene SDF, outer shell only, no inner shapes ────────────────────
 
 struct SceneHit { d: f32, cube_i: f32 }
 
@@ -157,7 +157,7 @@ fn inner_sdf(q_cube: vec3<f32>, cube_i: f32, t: f32) -> f32 {
     else                { return sd_cross(q, s * 0.70, s * 0.22); }       // cross
 }
 
-// ── Secondary march — runs only inside a confirmed cube hit ──────────────────
+// ── Secondary march, runs only inside a confirmed cube hit ──────────────────
 //
 // The ray entry/exit along the cube axis-aligned extent gives us a tight
 // interval [t_enter, t_exit] so the march is bounded and cheap.
@@ -175,7 +175,7 @@ fn march_inner(ro: vec3<f32>, rd: vec3<f32>, cube_i: f32, t_scene: f32, time: f3
     );
 
     // Walk back along the ray to find where we entered the cube's bounding
-    // sphere — gives a safe t_start before the confirmed surface.
+    // sphere, gives a safe t_start before the confirmed surface.
     let oc       = ro - offset;
     let R        = u.size * 1.42;
     let b_coef   = dot(oc, rd);
@@ -246,6 +246,57 @@ fn osd_mask(b: vec2<f32>) -> f32 {
     return step(0.5, d);
 }
 
+// ── Stutter / pacing markers ─────────────────────────────────────────────────
+//
+// RED  (stutter_decay):  filled diamond + all-edge border.
+//   Fires when EMA(vblank_mul) > 1.15, a sustained bad delivery regime.
+//   Lingers ~45 frames so a run of dropped scanouts leaves a long red ghost.
+//
+// YELLOW (pacing_decay): hollow ring + left/right edge bars only.
+//   Fires on any single vblank_mul > 1, a momentary ping, not an alarm.
+//   Fades quickly (~30 frames). Visually distinct from red: no fill, different
+//   edges, so screen recordings can tell the two apart at a glance.
+//   When both fire simultaneously they add to orange-white ("worst case").
+//
+// UV convention: in.uv is in [-1,1] clip space (x right, y up).
+
+fn stutter_marker(uv: vec2<f32>, decay: f32) -> vec3<f32> {
+    if (decay <= 0.0) { return vec3(0.0); }
+
+    let corner  = vec2(0.82, 0.88);
+    let delta   = abs(uv - corner);
+    // Rotated-square (L∞ in rotated frame) for a diamond silhouette.
+    let rot45   = vec2(delta.x + delta.y, abs(delta.x - delta.y)) * 0.7071;
+    let radius  = 0.055 * decay;
+    let diamond = step(rot45.x, radius) * step(rot45.y, radius);
+
+    // All-edge border: thin pulse on all four sides.
+    let border_w  = 0.012;
+    let edge_dist = min(1.0 - abs(uv.x), 1.0 - abs(uv.y));
+    let on_edge   = step(edge_dist, border_w) * sqrt(decay) * 0.7;
+
+    return vec3(1.0, 0.08, 0.04) * max(diamond, on_edge);   // saturated red
+}
+
+fn pacing_marker(uv: vec2<f32>, decay: f32) -> vec3<f32> {
+    if (decay <= 0.0) { return vec3(0.0); }
+
+    // Hollow ring, visually distinct from the filled red diamond.
+    let corner  = vec2(0.82, 0.88);
+    let dist    = length(uv - corner);
+    let outer_r = 0.055;
+    // Ring thins as decay falls, disappearing smoothly rather than snapping off.
+    let inner_r = outer_r - 0.018 * decay;
+    let ring    = step(inner_r, dist) * step(dist, outer_r) * decay;
+
+    // Left and right edge bars only, horizontal complement to red's all-edge border.
+    // Using opposite axis makes the two trivially distinguishable on video captures.
+    let border_w = 0.010;
+    let lr_edge  = step(1.0 - border_w, abs(uv.x)) * sqrt(decay) * 0.65;
+
+    return vec3(1.0, 0.82, 0.0) * max(ring, lr_edge);   // amber-yellow
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 @fragment
@@ -255,7 +306,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ro = vec3(0.0, 0.0, 10.0);
     let rd = normalize(vec3(uv, -1.8));
 
-    // Primary march — outer shells only.
+    // Primary march, outer shells only.
     var total  = 0.0;
     var min_d  = 1e10;
     var hit_t  = -1.0;
@@ -312,5 +363,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let osd = osd_mask(vec2((in.uv.x + 0.98) * 110.0, (0.98 - in.uv.y) * 110.0));
-    return vec4(mix(color, vec3(0.0, 1.0, 0.5), osd), 1.0);
+    let osd_col = mix(color, vec3(0.0, 1.0, 0.5), osd);
+    // Additive composite: red drop flash + yellow sustained-pressure flash.
+    // Both clamped to [0,1] so they never blow out HDR surfaces.
+    let stutter = stutter_marker(in.uv, u.stutter_decay);
+    let pacing  = pacing_marker(in.uv, u.pacing_decay);
+    return vec4(clamp(osd_col + stutter + pacing, vec3(0.0), vec3(1.0)), 1.0);
 }

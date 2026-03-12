@@ -1,4 +1,3 @@
-// uniforms.rs
 use wgpu::util::DeviceExt;
 
 use crate::args::Args;
@@ -10,15 +9,17 @@ use crate::args::Args;
 ///
 /// Layout (80 bytes, 16-byte aligned):
 /// ```text
-/// offset  0: color      [f32; 4]
-/// offset 16: cube_count u32
-/// offset 20: size       f32
-/// offset 24: speed      f32
-/// offset 28: steps      u32
-/// offset 32: fps_data   [f32; 4]
-/// offset 48: adv_data   [f32; 4]
-/// offset 64: time       f32
-/// offset 68: _pad       [f32; 3]
+/// offset  0: color         [f32; 4]
+/// offset 16: cube_count    u32
+/// offset 20: size          f32
+/// offset 24: speed         f32
+/// offset 28: steps         u32
+/// offset 32: fps_data      [f32; 4]
+/// offset 48: adv_data      [f32; 4]
+/// offset 64: time          f32
+/// offset 68: stutter_decay f32   — 1.0 on dropped frame, decays ~30 frames
+/// offset 72: pacing_decay  f32   — EMA(vblank_mul) pressure, decays ~45 frames
+/// offset 76: _pad          f32
 /// ```
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -32,7 +33,18 @@ pub struct ShaderUniforms {
     /// [jitter, dropped, ftv, _pad]
     pub adv_data: [f32; 4],
     pub time: f32,
-    pub _pad: [f32; 3],
+    /// Decaying stutter indicator: set to `1.0` when a frame is dropped or
+    /// jitter exceeds the configured threshold; decays by `STUTTER_DECAY_RATE`
+    /// each frame so the shader can render a fading visual marker.
+    pub stutter_decay: f32,
+    /// Sustained delivery-pressure indicator driven by an exponential moving
+    /// average of `vblank_mul`.  Rises toward `1.0` while `EMA > 1.15` (the
+    /// compositor is consistently delivering frames late) and decays at
+    /// `PACING_DECAY_RATE` per frame when delivery recovers.  Completely
+    /// orthogonal to `stutter_decay`: it measures a bad *regime*, not a
+    /// single bad frame.
+    pub pacing_decay: f32,
+    pub _pad: f32,
 }
 
 impl ShaderUniforms {
@@ -47,7 +59,9 @@ impl ShaderUniforms {
             fps_data: [0.0; 4],
             adv_data: [0.0; 4],
             time: 0.0,
-            _pad: [0.0; 3],
+            stutter_decay: 0.0,
+            pacing_decay: 0.0,
+            _pad: 0.0,
         }
     }
 
@@ -63,6 +77,8 @@ impl ShaderUniforms {
         dropped_frames: u32,
         ftv: f32,
         time: f32,
+        stutter_decay: f32,
+        pacing_decay: f32,
     ) -> Self {
         Self {
             color: [args.red, args.green, args.blue, 1.0],
@@ -73,7 +89,9 @@ impl ShaderUniforms {
             fps_data: [current_fps, min_fps, max_fps, low_1_fps],
             adv_data: [jitter, dropped_frames as f32, ftv, 0.0],
             time,
-            _pad: [0.0; 3],
+            stutter_decay,
+            pacing_decay,
+            _pad: 0.0,
         }
     }
 }

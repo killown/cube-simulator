@@ -152,6 +152,10 @@ target/release/frame-test
 
 ## Advanced Pacing & Stability
 
+- **Sustained Pressure** — An amber-yellow hollow ring appears in the top-right corner when `vblank_mul > 1` (any single frame missed its vblank slot). Fades over ~30 frames as a momentary ping.
+
+- **Stutter Flash** — A red filled diamond overlays the ring when the rolling `vblank_mul` EMA exceeds `1.15`, the compositor is consistently missing deadlines, not just spiking. Lingers ~45 frames.
+
 - **JIT (Jitter)**
   The average variance (in milliseconds) between consecutive frame times. Calculated as the mean of `abs(frame_time[i] - frame_time[i-1])`. High jitter indicates inconsistent frame pacing. Even if the application averages a perfect 60 FPS (16.6ms), alternating between 10ms and 23ms frames will produce a visually unpleasant micro-stuttering experience.
 
@@ -163,7 +167,7 @@ target/release/frame-test
 
   A value near **0%** means all frames took approximately the same time perfectly uniform delivery. A high value means frame times are spread widely: some frames complete in a few milliseconds while others take tens of milliseconds. Even if the mean FPS looks acceptable, this imbalance causes frames to bunch together and then stall, which the eye perceives as judder or skipping.
 
-  > **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
+> **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
 
 ### Performance Note: Why Raymarching?
 
