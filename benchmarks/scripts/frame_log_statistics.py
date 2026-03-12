@@ -1,9 +1,32 @@
+"""Frame log analyser for the wgpu compositor benchmark.
+
+Parses NDJSON frame logs produced by ``write_frame_log_row`` and emits a
+structured telemetry report covering:
+
+- Global pacing: delivery cadence, jitter, vblank-budget distribution
+- Phase drift: ns-precision histogram, percentile table, PLL suitability
+- Compositor bottleneck classification: GPU-overrun vs compositor-hold,
+  derived from the ``slack_ms`` / ``cpu_frame_ms`` cross-reference
+- Ping-pong (double-buffer phase lock) detection via ``ipc_delta_ms``
+- Clustered stutter events with per-event recovery analysis
+- Session-phase segmentation keyed on vblank multiplier regime
+
+Usage::
+
+    python frame_log_statistics.py <frame_log.json> [--markdown]
+"""
+
 import json
 import sys
 import statistics
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -39,16 +62,29 @@ class SessionPhase:
             abs(deltas[i] - deltas[i - 1]) for i in range(1, len(deltas))
         )
 
+    @property
+    def dominant_vblank_mul(self) -> Optional[int]:
+        """Most common vblank multiplier in this phase, or None if unavailable."""
+        muls = [f["vblank_mul"] for f in self.frames if "vblank_mul" in f]
+        if not muls:
+            return None
+        return max(set(muls), key=muls.count)
+
+    @property
+    def mean_sync(self) -> float:
+        scores = [f["sync"] for f in self.frames if "sync" in f]
+        return statistics.mean(scores) if scores else 0.0
+
 
 @dataclass
 class StutterEvent:
     """A discrete frame delivery anomaly or sustained cluster thereof.
 
-    A cluster groups consecutive anomalous frames within `merge_gap`
-    frames of each other into one compound event. `vblanks_missed`
+    A cluster groups consecutive anomalous frames within ``merge_gap``
+    frames of each other into one compound event. ``vblanks_missed``
     counts integer whole-vblank skips (delta > 2× ideal); frames with
     fractional-vblank delivery (e.g. 1.5×) are flagged separately via
-    `fractional_slip`.
+    ``fractional_slip``.
     """
 
     frame_index: int
@@ -81,6 +117,79 @@ class StutterEvent:
         return statistics.mean(
             abs(deltas[i] - deltas[i - 1]) for i in range(1, len(deltas))
         )
+
+
+@dataclass
+class BottleneckStats:
+    """Compositor bottleneck classification derived from ``slack_ms`` and ``cpu_frame_ms``.
+
+    Each frame with both fields present is classified into one of three categories:
+
+    - **GPU overrun**: ``slack_ms`` is near zero relative to ``ideal_ms``,
+      meaning the GPU was still executing at vblank time.
+    - **Compositor hold**: ``slack_ms - cpu_frame_ms > ideal_ms * 0.5``,
+      meaning the GPU finished early but the compositor delayed the flip —
+      indicative of ``max_render_time`` policy or deep buffer queues.
+    - **Healthy**: neither condition is true.
+    """
+
+    total_classified: int
+    gpu_overrun_count: int
+    compositor_hold_count: int
+    healthy_count: int
+    mean_hold_gap_ms: Optional[float]
+    p95_hold_gap_ms: Optional[float]
+    mean_slack_ms: Optional[float]
+    p99_slack_ms: Optional[float]
+
+    @property
+    def gpu_overrun_pct(self) -> float:
+        return (
+            100.0 * self.gpu_overrun_count / self.total_classified
+            if self.total_classified
+            else 0.0
+        )
+
+    @property
+    def compositor_hold_pct(self) -> float:
+        return (
+            100.0 * self.compositor_hold_count / self.total_classified
+            if self.total_classified
+            else 0.0
+        )
+
+    @property
+    def healthy_pct(self) -> float:
+        return (
+            100.0 * self.healthy_count / self.total_classified
+            if self.total_classified
+            else 0.0
+        )
+
+
+@dataclass
+class PingPongResult:
+    """Result of double-buffer ping-pong detection via ``ipc_delta_ms``.
+
+    A ping-pong pattern is a systematic alternation of fast and slow frames
+    (e.g. 7 ms / 11 ms / 7 ms / 11 ms) that cancels out in rolling jitter
+    averages but produces visible judder. Detected by measuring the rate of
+    sign-flips in consecutive ``ipc_delta_ms`` values.
+    """
+
+    detected: bool
+    sign_flip_rate: float
+    """Fraction of consecutive ipc_delta_ms pairs with opposite signs.
+    Values above ~0.70 indicate systematic alternation."""
+    mean_fast_ms: Optional[float]
+    mean_slow_ms: Optional[float]
+    spread_ms: Optional[float]
+    """Mean fast/slow separation; > 2 ms is perceptually salient."""
+
+
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
 
 
 def _load_frames(file_path: str) -> list[dict]:
@@ -134,6 +243,173 @@ def _load_frames(file_path: str) -> list[dict]:
     return raw
 
 
+# ---------------------------------------------------------------------------
+# Analysis functions
+# ---------------------------------------------------------------------------
+
+
+def _vblank_distribution(frames: list[dict]) -> dict[int, int]:
+    """Counts frames by their vblank multiplier.
+
+    Args:
+        frames: Full ordered list of frame records.
+
+    Returns:
+        Dict mapping vblank_mul → frame count, sorted ascending by key.
+    """
+    dist: dict[int, int] = {}
+    for f in frames:
+        mul = f.get("vblank_mul")
+        if mul is not None:
+            dist[mul] = dist.get(mul, 0) + 1
+    return dict(sorted(dist.items()))
+
+
+def _drift_percentiles(frames: list[dict]) -> dict[str, float]:
+    """Computes phase drift percentiles in nanoseconds from ``drift_ns``.
+
+    Falls back to ``drift_ms * 1_000_000`` when ``drift_ns`` is absent.
+    Nanosecond precision matters when evaluating whether the drift signal
+    is suitable for feeding a compositor's repaint-timer PLL.
+
+    Args:
+        frames: Full ordered list of frame records.
+
+    Returns:
+        Dict with keys min, p1, p5, p25, p50, p75, p95, p99, max (all in ns).
+    """
+    values_ns = sorted(
+        f.get("drift_ns", int(f["drift_ms"] * 1_000_000)) for f in frames
+    )
+    n = len(values_ns)
+
+    def pct(p: float) -> float:
+        idx = max(0, min(n - 1, int(p / 100.0 * n)))
+        return float(values_ns[idx])
+
+    return {
+        "min": float(values_ns[0]),
+        "p1": pct(1),
+        "p5": pct(5),
+        "p25": pct(25),
+        "p50": pct(50),
+        "p75": pct(75),
+        "p95": pct(95),
+        "p99": pct(99),
+        "max": float(values_ns[-1]),
+    }
+
+
+def _classify_bottleneck(frames: list[dict], ideal_ms: float) -> BottleneckStats:
+    """Classifies each frame with slack_ms + cpu_frame_ms into GPU/compositor/healthy.
+
+    A frame is **GPU overrun** when ``slack_ms < ideal_ms * 0.25``, meaning
+    the GPU was almost certainly still executing at vblank time.
+
+    A frame is **compositor hold** when ``slack_ms - cpu_frame_ms > ideal_ms * 0.5``,
+    meaning the GPU finished the work well before presentation, the extra
+    latency belongs to the compositor's scheduling policy.
+
+    Args:
+        frames: Full ordered list of frame records.
+        ideal_ms: Monitor vblank period in milliseconds.
+
+    Returns:
+        BottleneckStats with per-category counts and hold-gap distribution.
+    """
+    classified = [
+        f
+        for f in frames
+        if f.get("slack_ms") is not None and f.get("cpu_frame_ms") is not None
+    ]
+
+    if not classified:
+        return BottleneckStats(0, 0, 0, 0, None, None, None, None)
+
+    gpu_overrun, compositor_hold, healthy = [], [], []
+    hold_gaps: list[float] = []
+    slacks = [f["slack_ms"] for f in classified]
+
+    gpu_threshold = ideal_ms * 0.25
+    hold_threshold = ideal_ms * 0.5
+
+    for f in classified:
+        slack = f["slack_ms"]
+        cpu = f["cpu_frame_ms"]
+        hold_gap = slack - cpu
+
+        if slack < gpu_threshold:
+            gpu_overrun.append(f)
+        elif hold_gap > hold_threshold:
+            compositor_hold.append(f)
+            hold_gaps.append(hold_gap)
+        else:
+            healthy.append(f)
+
+    sorted_gaps = sorted(hold_gaps)
+    sorted_slacks = sorted(slacks)
+
+    return BottleneckStats(
+        total_classified=len(classified),
+        gpu_overrun_count=len(gpu_overrun),
+        compositor_hold_count=len(compositor_hold),
+        healthy_count=len(healthy),
+        mean_hold_gap_ms=statistics.mean(hold_gaps) if hold_gaps else None,
+        p95_hold_gap_ms=sorted_gaps[int(0.95 * len(sorted_gaps))]
+        if sorted_gaps
+        else None,
+        mean_slack_ms=statistics.mean(slacks),
+        p99_slack_ms=sorted_slacks[int(0.99 * len(sorted_slacks))],
+    )
+
+
+def _detect_ping_pong(frames: list[dict]) -> PingPongResult:
+    """Detects double-buffer phase-lock ping-pong via ``ipc_delta_ms``.
+
+    A sign-flip rate above 0.70 in consecutive ``ipc_delta_ms`` values
+    indicates the compositor is alternating frame delivery between two
+    fixed cadences, the classic double-buffer ping-pong fingerprint.
+
+    Args:
+        frames: Full ordered list of frame records.
+
+    Returns:
+        PingPongResult with detection flag and characterisation metrics.
+    """
+    ipcs = [f["ipc_delta_ms"] for f in frames if f.get("ipc_delta_ms") is not None]
+
+    if len(ipcs) < 10:
+        return PingPongResult(False, 0.0, None, None, None)
+
+    sign_flips = sum(1 for i in range(1, len(ipcs)) if ipcs[i] * ipcs[i - 1] < 0)
+    flip_rate = sign_flips / (len(ipcs) - 1)
+
+    if flip_rate < 0.70:
+        return PingPongResult(False, flip_rate, None, None, None)
+
+    # Characterise the two cadences by splitting deltas on above/below median.
+    deltas = [f["delta_ms"] for f in frames]
+    median_d = statistics.median(deltas)
+    fast = [d for d in deltas if d <= median_d]
+    slow = [d for d in deltas if d > median_d]
+
+    mean_fast = statistics.mean(fast) if fast else None
+    mean_slow = statistics.mean(slow) if slow else None
+    spread = (
+        (mean_slow - mean_fast)
+        if mean_fast is not None and mean_slow is not None
+        else None
+    )
+
+    return PingPongResult(
+        detected=True,
+        sign_flip_rate=flip_rate,
+        mean_fast_ms=mean_fast,
+        mean_slow_ms=mean_slow,
+        spread_ms=spread,
+    )
+
+
 def _detect_stutter_events(
     frames: list[dict],
     ideal_ms: float,
@@ -143,14 +419,14 @@ def _detect_stutter_events(
 ) -> list[StutterEvent]:
     """Identifies and clusters frame delivery anomalies.
 
-    A frame is anomalous if its delta >= `stutter_threshold_x` × ideal_ms.
-    Consecutive anomalous frames whose global indices are within `merge_gap`
+    A frame is anomalous if its delta >= ``stutter_threshold_x`` × ideal_ms.
+    Consecutive anomalous frames whose global indices are within ``merge_gap``
     of each other are merged into a single compound StutterEvent so that
-    sustained cadence degradations (e.g. a 60-frame ~126Hz slip) are not
-    reported as dozens of independent minor events.
+    sustained cadence degradations are not reported as dozens of independent
+    minor events.
 
-    Distinguishes whole-vblank misses (delta > 2× ideal, `vblanks_missed > 0`)
-    from fractional-vblank slips (1.5×–2× ideal, `fractional_slip = True`).
+    Distinguishes whole-vblank misses (delta > 2× ideal, ``vblanks_missed > 0``)
+    from fractional-vblank slips (1.5×–2× ideal, ``fractional_slip = True``).
 
     Args:
         frames: Full ordered list of frame records with ``global_index``.
@@ -280,6 +556,11 @@ def _segment_phases(
     return phases
 
 
+# ---------------------------------------------------------------------------
+# Labels and verdicts
+# ---------------------------------------------------------------------------
+
+
 def _performance_label(multiplier: float) -> str:
     if 0.95 <= multiplier <= 1.05:
         return "PERFECT (Native Refresh)"
@@ -294,6 +575,29 @@ def _jitter_label(jitter: float) -> str:
     if jitter < 1.0:
         return "STABLE"
     return "STUTTERY"
+
+
+def _sync_label(avg_sync: float) -> str:
+    if avg_sync >= 90:
+        return "EXCELLENT"
+    if avg_sync >= 70:
+        return "GOOD"
+    if avg_sync >= 50:
+        return "MARGINAL"
+    return "POOR"
+
+
+def _bottleneck_verdict(bn: BottleneckStats) -> str:
+    """One-line compositor bottleneck summary."""
+    if bn.total_classified == 0:
+        return "Insufficient data (slack_ms not present in log)"
+    dominant = max(
+        ("GPU overrun", bn.gpu_overrun_pct),
+        ("Compositor hold", bn.compositor_hold_pct),
+        ("Healthy", bn.healthy_pct),
+        key=lambda x: x[1],
+    )
+    return f"{dominant[0]} dominant ({dominant[1]:.1f}% of classified frames)"
 
 
 def _verdict(multiplier: float, jitter: float, avg_sync: float) -> str:
@@ -314,6 +618,11 @@ def _verdict(multiplier: float, jitter: float, avg_sync: float) -> str:
     return "ACCEPTABLE. Standard presentation timing."
 
 
+# ---------------------------------------------------------------------------
+# Report renderers
+# ---------------------------------------------------------------------------
+
+
 def _print_markdown_report(
     file_path: str,
     frames: list[dict],
@@ -326,6 +635,10 @@ def _print_markdown_report(
     max_drift: float,
     drift_stdev: float,
     multiplier: float,
+    drift_pct: dict[str, float],
+    vblank_dist: dict[int, int],
+    bottleneck: BottleneckStats,
+    ping_pong: PingPongResult,
     stutter_events: list[StutterEvent],
     phases: list[SessionPhase],
 ) -> None:
@@ -346,13 +659,64 @@ def _print_markdown_report(
     print(f"| V-Sync Multiplier | {multiplier:.2f} x | |")
     print(f"| Jitter (IFI delta) | {jitter:.4f} ms | {_jitter_label(jitter)} |\n")
 
+    print("## Vblank Budget Distribution\n")
+    print("| Vblank × | Frames | Share |")
+    print("|---|---|---|")
+    for mul, count in vblank_dist.items():
+        pct = 100.0 * count / len(frames)
+        label = "on-time" if mul == 1 else f"{mul - 1} dropped"
+        print(f"| {mul}× ({label}) | {count} | {pct:.1f}% |")
+    print()
+
     print("## Phase Drift\n")
     print("| Metric | Value |")
     print("|---|---|")
     print(f"| Avg Phase Drift | {avg_drift:+.4f} ms |")
     print(f"| Max Phase Drift | {max_drift:+.4f} ms |")
     print(f"| Drift Std Dev | {drift_stdev:.4f} ms |")
-    print(f"| Avg Sync Score | {avg_sync:.2f} % |\n")
+    print(f"| Avg Sync Score | {avg_sync:.2f} % ({_sync_label(avg_sync)}) |\n")
+
+    print("### Drift Percentiles (nanoseconds)\n")
+    print("| Percentile | ns |")
+    print("|---|---|")
+    for label, val in drift_pct.items():
+        print(f"| {label} | {val:+.0f} ns |")
+    print()
+
+    print("## Compositor Bottleneck Analysis\n")
+    if bottleneck.total_classified == 0:
+        print(
+            "*`slack_ms` not present in log, bottleneck classification unavailable.*\n"
+        )
+    else:
+        print(f"**{_bottleneck_verdict(bottleneck)}**\n")
+        print(f"- Frames classified: {bottleneck.total_classified}")
+        print(
+            f"- GPU overrun: {bottleneck.gpu_overrun_count} ({bottleneck.gpu_overrun_pct:.1f}%)"
+        )
+        print(
+            f"- Compositor hold: {bottleneck.compositor_hold_count} ({bottleneck.compositor_hold_pct:.1f}%)"
+        )
+        print(f"- Healthy: {bottleneck.healthy_count} ({bottleneck.healthy_pct:.1f}%)")
+        if bottleneck.mean_hold_gap_ms is not None:
+            print(f"- Mean hold gap: {bottleneck.mean_hold_gap_ms:.4f} ms")
+            print(f"- P95 hold gap: {bottleneck.p95_hold_gap_ms:.4f} ms")
+        if bottleneck.mean_slack_ms is not None:
+            print(f"- Mean slack: {bottleneck.mean_slack_ms:.4f} ms")
+            print(f"- P99 slack: {bottleneck.p99_slack_ms:.4f} ms")
+        print()
+
+    print("## Double-Buffer Ping-Pong\n")
+    if ping_pong.detected:
+        print(f"**DETECTED** (sign-flip rate: {ping_pong.sign_flip_rate:.2f})\n")
+        print(f"- Mean fast cadence: {ping_pong.mean_fast_ms:.4f} ms")
+        print(f"- Mean slow cadence: {ping_pong.mean_slow_ms:.4f} ms")
+        print(f"- Frame-time spread: {ping_pong.spread_ms:.4f} ms")
+        print()
+        print("> Systematic fast/slow alternation indicates the compositor is locked")
+        print("> to two fixed delivery slots, visible judder even at nominal FPS.\n")
+    else:
+        print(f"Not detected (sign-flip rate: {ping_pong.sign_flip_rate:.2f})\n")
 
     print("## Stutter Events\n")
     if not stutter_events:
@@ -388,13 +752,14 @@ def _print_markdown_report(
     if len(phases) > 1:
         print("## Session Phases\n")
         print("*Cadence regimes, keyed on global frame index*\n")
-        print("| # | GLOBAL IDX | MEAN Δ | EFF. Hz | JITTER |")
-        print("|---|---|---|---|---|")
+        print("| # | GLOBAL IDX | MEAN Δ | EFF. Hz | JITTER | DOM. VBLANK× | SYNC |")
+        print("|---|---|---|---|---|---|---|")
         for idx, ph in enumerate(phases, 1):
             frame_range = f"{ph.start_frame}–{ph.end_frame}"
+            dom = f"{ph.dominant_vblank_mul}×" if ph.dominant_vblank_mul else "—"
             print(
                 f"| {idx} | {frame_range} | {ph.mean_delta:.4f} ms | "
-                f"{ph.effective_hz:.1f} Hz | {ph.jitter:.4f} ms |"
+                f"{ph.effective_hz:.1f} Hz | {ph.jitter:.4f} ms | {dom} | {ph.mean_sync:.1f}% |"
             )
         print()
 
@@ -408,66 +773,39 @@ def _print_markdown_report(
         print()
 
 
-def analyze_frame_log(file_path: str, markdown: bool = False) -> None:
-    """Prints a telemetry report for a frame log produced by the wgpu benchmark.
-
-    Covers global pacing stats, clustered stutter events with recovery
-    analysis, and a per-phase cadence breakdown keyed on global frame index
-    to handle concatenated/reset log files correctly.
-
-    Args:
-        file_path: Path to the NDJSON frame log file.
-    """
-    frames = _load_frames(file_path)
-
-    deltas = [f["delta_ms"] for f in frames]
-    drifts = [f["drift_ms"] for f in frames]
-    sync_scores = [f["sync"] for f in frames]
-    ideal = frames[0]["ideal_ms"]
-    target_hz = 1000.0 / ideal
-
-    avg_delta = statistics.mean(deltas)
-    jitter = statistics.mean(
-        abs(deltas[i] - deltas[i - 1]) for i in range(1, len(deltas))
-    )
-    avg_sync = statistics.mean(sync_scores)
-    avg_drift = statistics.mean(drifts)
-    max_drift = max(drifts, key=abs)
-    drift_stdev = statistics.stdev(drifts) if len(drifts) > 1 else 0.0
-    multiplier = avg_delta / ideal
-
-    stutter_events = _detect_stutter_events(frames, ideal)
-    phases = _segment_phases(frames, ideal)
-
-    if markdown:
-        _print_markdown_report(
-            file_path,
-            frames,
-            ideal,
-            target_hz,
-            avg_delta,
-            jitter,
-            avg_sync,
-            avg_drift,
-            max_drift,
-            drift_stdev,
-            multiplier,
-            stutter_events,
-            phases,
-        )
-        return
-
-    W = 70
+def _print_terminal_report(
+    file_path: str,
+    frames: list[dict],
+    ideal: float,
+    target_hz: float,
+    avg_delta: float,
+    jitter: float,
+    avg_sync: float,
+    avg_drift: float,
+    max_drift: float,
+    drift_stdev: float,
+    multiplier: float,
+    drift_pct: dict[str, float],
+    vblank_dist: dict[int, int],
+    bottleneck: BottleneckStats,
+    ping_pong: PingPongResult,
+    stutter_events: list[StutterEvent],
+    phases: list[SessionPhase],
+) -> None:
+    """Prints the telemetry report to stdout in aligned plain-text format."""
+    W = 72
     sep = "─" * W
 
     print(f"\n{'━' * W}")
     print(f"  TELEMETRY REPORT  ·  {os.path.basename(file_path)}")
     print(f"{'━' * W}")
 
+    duration_s = sum(f["delta_ms"] for f in frames) / 1000.0
     print(f"\n  TARGET            {target_hz:.1f} Hz  ({ideal:.4f} ms/frame)")
     print(f"  FRAMES ANALYSED   {len(frames)}")
-    print(f"  SESSION DURATION  {sum(deltas) / 1000:.2f} s\n")
+    print(f"  SESSION DURATION  {duration_s:.2f} s\n")
 
+    # ── Global Pacing ───────────────────────────────────────────────────────
     print(sep)
     print("  GLOBAL PACING")
     print(sep)
@@ -476,18 +814,76 @@ def analyze_frame_log(file_path: str, markdown: bool = False) -> None:
     )
     print(f"  V-Sync Multiplier     {multiplier:8.2f} x")
     print(f"  Jitter (IFI delta)    {jitter:8.4f} ms   [{_jitter_label(jitter)}]")
+
+    # ── Vblank Budget Distribution ──────────────────────────────────────────
+    print(sep)
+    print("  VBLANK BUDGET DISTRIBUTION")
+    print(sep)
+    for mul, count in vblank_dist.items():
+        pct = 100.0 * count / len(frames)
+        bar_len = int(pct / 2)
+        label = "on-time" if mul == 1 else f"{mul - 1} dropped"
+        bar = "█" * bar_len
+        print(f"  {mul:>2}× ({label:<10})  {count:>6} frames  {pct:5.1f}%  {bar}")
+
+    # ── Phase Drift ─────────────────────────────────────────────────────────
     print(sep)
     print("  PHASE DRIFT")
     print(sep)
     print(f"  Avg Phase Drift       {avg_drift:+8.4f} ms")
     print(f"  Max Phase Drift       {max_drift:+8.4f} ms")
     print(f"  Drift Std Dev         {drift_stdev:8.4f} ms")
-    print(f"  Avg Sync Score        {avg_sync:8.2f} %")
+    print(f"  Avg Sync Score        {avg_sync:8.2f} %   [{_sync_label(avg_sync)}]")
+    print()
+    print(f"  {'Percentile':<10}  {'drift_ns':>14}   {'drift_ms':>10}")
+    print(f"  {'─' * 10}  {'─' * 14}   {'─' * 10}")
+    for label, val_ns in drift_pct.items():
+        print(f"  {label:<10}  {val_ns:>+14.0f} ns   {val_ns / 1_000_000:>+10.4f} ms")
 
+    # ── Compositor Bottleneck ───────────────────────────────────────────────
+    print(f"\n{sep}")
+    print("  COMPOSITOR BOTTLENECK ANALYSIS")
+    print(sep)
+    if bottleneck.total_classified == 0:
+        print("  slack_ms not present, classification unavailable\n")
+    else:
+        print(f"  Classified frames      {bottleneck.total_classified}")
+        print(
+            f"  GPU overrun            {bottleneck.gpu_overrun_count:>6}  ({bottleneck.gpu_overrun_pct:5.1f}%)"
+        )
+        print(
+            f"  Compositor hold        {bottleneck.compositor_hold_count:>6}  ({bottleneck.compositor_hold_pct:5.1f}%)"
+        )
+        print(
+            f"  Healthy                {bottleneck.healthy_count:>6}  ({bottleneck.healthy_pct:5.1f}%)"
+        )
+        if bottleneck.mean_hold_gap_ms is not None:
+            print(f"  Mean hold gap         {bottleneck.mean_hold_gap_ms:8.4f} ms")
+            print(f"  P95  hold gap         {bottleneck.p95_hold_gap_ms:8.4f} ms")
+        if bottleneck.mean_slack_ms is not None:
+            print(f"  Mean slack            {bottleneck.mean_slack_ms:8.4f} ms")
+            print(f"  P99  slack            {bottleneck.p99_slack_ms:8.4f} ms")
+        print(f"\n  [{_bottleneck_verdict(bottleneck)}]")
+
+    # ── Ping-Pong ───────────────────────────────────────────────────────────
+    print(f"\n{sep}")
+    print("  DOUBLE-BUFFER PING-PONG")
+    print(sep)
+    if ping_pong.detected:
+        print(f"  DETECTED  (sign-flip rate: {ping_pong.sign_flip_rate:.2f})")
+        print(f"  Mean fast cadence     {ping_pong.mean_fast_ms:8.4f} ms")
+        print(f"  Mean slow cadence     {ping_pong.mean_slow_ms:8.4f} ms")
+        print(f"  Frame-time spread     {ping_pong.spread_ms:8.4f} ms")
+        print()
+        print("  Systematic alternation: compositor locked to two delivery slots.")
+        print("  Visible judder likely even at nominal FPS.")
+    else:
+        print(f"  Not detected  (sign-flip rate: {ping_pong.sign_flip_rate:.2f})")
+
+    # ── Stutter Events ──────────────────────────────────────────────────────
     print(f"\n{sep}")
     print("  STUTTER EVENTS")
     print(sep)
-
     if not stutter_events:
         print("  None detected.\n")
     else:
@@ -519,23 +915,101 @@ def analyze_frame_log(file_path: str, markdown: bool = False) -> None:
             )
         print("\n  ~ = fractional vblank slip (1.25×–2× ideal, no whole vblank missed)")
 
+    # ── Session Phases ──────────────────────────────────────────────────────
     if len(phases) > 1:
         print(f"\n{sep}")
         print("  SESSION PHASES  (cadence regimes, keyed on global frame index)")
         print(sep)
-        col = f"  {'#':>3}  {'GLOBAL IDX':>14}  {'MEAN Δ':>9}  {'EFF. Hz':>8}  {'JITTER':>9}"
+        col = (
+            f"  {'#':>3}  {'GLOBAL IDX':>14}  {'MEAN Δ':>9}"
+            f"  {'EFF. Hz':>8}  {'JITTER':>9}  {'DOM.×':>6}  {'SYNC':>6}"
+        )
         print(col)
-        print(f"  {'─' * 3}  {'─' * 14}  {'─' * 9}  {'─' * 8}  {'─' * 9}")
+        print(
+            f"  {'─' * 3}  {'─' * 14}  {'─' * 9}  {'─' * 8}  {'─' * 9}  {'─' * 6}  {'─' * 6}"
+        )
         for idx, ph in enumerate(phases, 1):
             frame_range = f"{ph.start_frame}–{ph.end_frame}"
+            dom = f"{ph.dominant_vblank_mul}×" if ph.dominant_vblank_mul else "—"
             print(
                 f"  {idx:>3}  {frame_range:>14}  {ph.mean_delta:>8.4f}ms"
                 f"  {ph.effective_hz:>7.1f}Hz  {ph.jitter:>8.4f}ms"
+                f"  {dom:>6}  {ph.mean_sync:>5.1f}%"
             )
 
+    # ── Verdict ─────────────────────────────────────────────────────────────
     print(f"\n{sep}")
     print(f"  VERDICT: {_verdict(multiplier, jitter, avg_sync)}")
     print(f"{'━' * W}\n")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def analyze_frame_log(file_path: str, markdown: bool = False) -> None:
+    """Prints a telemetry report for a frame log produced by the wgpu benchmark.
+
+    Covers global pacing stats, vblank budget distribution, phase drift with
+    nanosecond-precision percentile table, compositor bottleneck classification
+    (GPU overrun vs compositor hold via slack_ms cross-reference), double-buffer
+    ping-pong detection, clustered stutter events with recovery analysis, and a
+    per-phase cadence breakdown.
+
+    Args:
+        file_path: Path to the NDJSON frame log file.
+        markdown: When True, emit Markdown instead of plain-text terminal output.
+    """
+    frames = _load_frames(file_path)
+
+    deltas = [f["delta_ms"] for f in frames]
+    drifts = [f["drift_ms"] for f in frames]
+    sync_scores = [f["sync"] for f in frames]
+    ideal = frames[0]["ideal_ms"]
+    target_hz = 1000.0 / ideal
+
+    avg_delta = statistics.mean(deltas)
+    jitter = statistics.mean(
+        abs(deltas[i] - deltas[i - 1]) for i in range(1, len(deltas))
+    )
+    avg_sync = statistics.mean(sync_scores)
+    avg_drift = statistics.mean(drifts)
+    max_drift = max(drifts, key=abs)
+    drift_stdev = statistics.stdev(drifts) if len(drifts) > 1 else 0.0
+    multiplier = avg_delta / ideal
+
+    drift_pct = _drift_percentiles(frames)
+    vblank_dist = _vblank_distribution(frames)
+    bottleneck = _classify_bottleneck(frames, ideal)
+    ping_pong = _detect_ping_pong(frames)
+    stutter_events = _detect_stutter_events(frames, ideal)
+    phases = _segment_phases(frames, ideal)
+
+    common_args = dict(
+        file_path=file_path,
+        frames=frames,
+        ideal=ideal,
+        target_hz=target_hz,
+        avg_delta=avg_delta,
+        jitter=jitter,
+        avg_sync=avg_sync,
+        avg_drift=avg_drift,
+        max_drift=max_drift,
+        drift_stdev=drift_stdev,
+        multiplier=multiplier,
+        drift_pct=drift_pct,
+        vblank_dist=vblank_dist,
+        bottleneck=bottleneck,
+        ping_pong=ping_pong,
+        stutter_events=stutter_events,
+        phases=phases,
+    )
+
+    if markdown:
+        _print_markdown_report(**common_args)
+    else:
+        _print_terminal_report(**common_args)
 
 
 if __name__ == "__main__":
@@ -545,7 +1019,7 @@ if __name__ == "__main__":
         args.remove("--markdown")
 
     if not args:
-        print("Usage: python analyze.py <frame_log.json> [--markdown]")
+        print("Usage: python frame_log_statistics.py <frame_log.json> [--markdown]")
         sys.exit(1)
 
     analyze_frame_log(args[0], markdown=use_md)
