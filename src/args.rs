@@ -33,4 +33,22 @@ pub struct Args {
     /// Run without this flag to print all active connectors and their modes.
     #[arg(long)]
     pub connector: Option<String>,
+    /// Enable compositor stress benchmark mode.
+    ///
+    /// Tests cube counts 1, 2, 3, … N seconds each. The first `--bench-warmup`
+    /// seconds of every step are discarded so compositor startup jitter does not
+    /// pollute the signal. Stops and reports results when `vblank_mul > 1`
+    /// (yellow ring) or `EMA(vblank_mul) > 1.15` (red diamond) are triggered,
+    /// or when the sweep completes cleanly.
+    #[arg(long)]
+    pub bench_secs: Option<u64>,
+    /// Seconds to skip at the start of each benchmark step (compositor warmup).
+    ///
+    /// Defaults to `2` when `--bench-secs` is active. Must be strictly less than
+    /// `--bench-secs`.
+    #[arg(long, default_value_t = 2)]
+    pub bench_warmup: u64,
+    /// Maximum cube count to probe in benchmark mode (default: 64).
+    #[arg(long, default_value_t = 64)]
+    pub bench_max: u32,
 }

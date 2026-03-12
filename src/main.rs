@@ -1,5 +1,6 @@
 mod app;
 mod args;
+mod benchmark;
 mod drm;
 mod metrics;
 mod renderer;
@@ -13,6 +14,18 @@ use args::Args;
 
 fn main() {
     let args = Args::parse();
+
+    if args
+        .bench_secs
+        .is_some_and(|secs| args.bench_warmup >= secs)
+    {
+        eprintln!(
+            "Error: --bench-warmup ({}) must be less than --bench-secs ({})",
+            args.bench_warmup,
+            args.bench_secs.unwrap()
+        );
+        std::process::exit(1);
+    }
 
     let drm_info = drm::query();
 
@@ -52,7 +65,7 @@ fn main() {
                 std::process::exit(1);
             }
 
-            // DRM available but no active connectors — fall through with winit fallback.
+            // DRM available but no active connectors, fall through with winit fallback.
             run(args, drm_info);
         }
 
@@ -77,10 +90,10 @@ fn main() {
             run(args, drm_info);
         }
 
-        // No --connector and no DRM — proceed with winit fallback, warn once.
+        // No --connector and no DRM, proceed with winit fallback, warn once.
         (None, None) => {
             eprintln!(
-                "WARN: DRM unavailable — refresh rate from winit may be wrong. \
+                "WARN: DRM unavailable, refresh rate from winit may be wrong. \
                        Pass --connector if pacing metrics look incorrect."
             );
             run(args, None);

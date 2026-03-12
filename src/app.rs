@@ -42,7 +42,7 @@ impl<'a> ApplicationHandler for App<'a> {
             LOW:  1% Low FPS (stutter indicator)\n\
             JIT:  Frame-to-frame variance (ms)\n\
             MSD:  Missed frames (>{:.1}ms threshold)\n\
-            FTV:  Frame Time Variance %% — stddev/mean of frame times in the rolling window.\n\
+            FTV:  Frame Time Variance %%, stddev/mean of frame times in the rolling window.\n\
                   0%% = perfectly uniform delivery. High %% = frames bunching (some near-instant,\n\
                   some very slow), which looks skippy even when mean FPS appears acceptable.\n",
             self.args.threshold
@@ -75,6 +75,18 @@ impl<'a> ApplicationHandler for App<'a> {
                 }
                 WindowEvent::RedrawRequested => {
                     let _ = state.render();
+
+                    // A completed benchmark terminates the event loop and prints
+                    // the report. The render() call above still completes so the
+                    // final frame (with the triggering cube count) is presented.
+                    if state.benchmark_done {
+                        if let Some(bench) = &state.benchmark {
+                            bench.print_report();
+                        }
+                        el.exit();
+                        return;
+                    }
+
                     state.window.request_redraw();
                 }
                 _ => (),

@@ -90,7 +90,34 @@ The simulator automatically selects the best available present mode (Mailbox > I
 
 ---
 
+### Benchmark Mode (`--bench-secs`)
+
+Automatically sweeps cube counts from `1` up to `--bench-max`, holding each count for `--bench-secs` seconds. The first `--bench-warmup` seconds of every step are discarded so compositor startup jitter does not pollute the signal. The sweep stops and the window closes automatically when a pacing signal fires or the full range completes cleanly.
+
+| Argument         | Description                                                              | Default |
+| :--------------- | :----------------------------------------------------------------------- | :------ |
+| `--bench-secs`   | Seconds per step. Enables benchmark mode when set.                       | None    |
+| `--bench-warmup` | Seconds to discard at the start of each step (must be < `--bench-secs`). | `2`     |
+| `--bench-max`    | Maximum cube count to probe before declaring a clean sweep.              | `64`    |
+
+**Stop conditions** (checked only after the warmup window expires):
+
+- **Yellow** — `vblank_mul > 1` on any single frame (amber ring fires). An isolated missed vblank slot.
+- **Red** — `EMA(vblank_mul) > 1.15` (red diamond fires). Sustained compositor pressure, not just a spike.
+
+The final report is printed to stdout before the window closes, showing the maximum clean cube count and the trigger that ended the sweep.
+
 ### Quick Usage Examples
+
+#### Benchmark
+
+```bash
+# 5s per step, default 2s warmup, probe up to 32 cubes
+target/release/frame-test --bench-secs 5 --bench-max 32 --connector DP-1
+
+# Longer measurement window with tighter warmup
+target/release/frame-test --bench-secs 10 --bench-warmup 3 --bench-max 64 --connector HDMI-A-1
+```
 
 #### Stress Test (120 Cubes, 10ms Target)
 

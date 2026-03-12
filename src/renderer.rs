@@ -5,6 +5,7 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use crate::args::Args;
+use crate::benchmark::BenchmarkState;
 use crate::metrics::{
     FrameMetrics, PacingAnalyzer, write_csv_row, write_frame_log_row, write_json_row,
 };
@@ -55,6 +56,14 @@ pub struct State<'a> {
     /// `vblank_mul_ema` exceeds the `PACING_EMA_THRESHOLD`; decays at
     /// `PACING_DECAY_RATE` per frame when delivery recovers.
     pacing_decay: f32,
+    /// Active benchmark state machine; `None` when not in `--bench-secs` mode.
+    pub benchmark: Option<BenchmarkState>,
+    /// Set to `true` on the frame where the benchmark terminates, signalling the
+    /// app layer to call `el.exit()` after this `RedrawRequested` completes.
+    pub benchmark_done: bool,
+    /// Whether the most-recently-processed pacing record had `vblank_mul > 1`.
+    /// Reset each frame; fed into the benchmark tick.
+    any_vblank_miss_this_frame: bool,
 }
 
 impl<'a> State<'a> {
@@ -217,7 +226,14 @@ impl<'a> State<'a> {
             Some(f)
         });
 
-        let initial_uniforms = ShaderUniforms::from_args(&args, args.cubes);
+        // In benchmark mode the initial cube count is always 1; the machine
+        // drives `current_cubes` forward from there.
+        let initial_cube_count = if args.bench_secs.is_some() {
+            1
+        } else {
+            args.cubes
+        };
+        let initial_uniforms = ShaderUniforms::from_args(&args, initial_cube_count);
         let uniform_binding = UniformBinding::new(&device, &initial_uniforms);
 
         let config = wgpu::SurfaceConfiguration {
@@ -274,6 +290,10 @@ impl<'a> State<'a> {
             cache: None,
         });
 
+        let benchmark = args
+            .bench_secs
+            .map(|secs| BenchmarkState::new(secs, args.bench_warmup, args.bench_max));
+
         let now = std::time::Instant::now();
         Self {
             surface,
@@ -297,6 +317,9 @@ impl<'a> State<'a> {
             stutter_decay: 0.0,
             vblank_mul_ema: 1.0,
             pacing_decay: 0.0,
+            benchmark,
+            benchmark_done: false,
+            any_vblank_miss_this_frame: false,
         }
     }
 
@@ -331,6 +354,7 @@ impl<'a> State<'a> {
         // pacing_decay (yellow) is set on any single vblank_mul > 1.
         self.stutter_decay = (self.stutter_decay - STUTTER_DECAY_RATE).max(0.0);
         self.pacing_decay = (self.pacing_decay - PACING_DECAY_RATE).max(0.0);
+        self.any_vblank_miss_this_frame = false;
 
         // Write time in one upload before acquire.
         self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
@@ -434,6 +458,7 @@ impl<'a> State<'a> {
                     // Any single missed vblank is a yellow warning, a momentary ping.
                     if record.vblank_mul > 1 {
                         self.pacing_decay = 1.0;
+                        self.any_vblank_miss_this_frame = true;
                     }
 
                     // EMA breach is the severe regime, fire red and let it linger.
@@ -459,9 +484,16 @@ impl<'a> State<'a> {
             write_csv_row(&mut self.csv_file, &stats);
             write_json_row(&mut self.json_file, &stats);
 
+            // In benchmark mode the cube count may have been updated mid-step;
+            // always read from the state machine so the uniform stays in sync.
+            let live_cube_count = self
+                .benchmark
+                .as_ref()
+                .map_or(self.args.cubes, |b| b.current_cubes);
+
             self.current_uniforms = ShaderUniforms::with_metrics(
                 &self.args,
-                self.args.cubes,
+                live_cube_count,
                 stats.current_fps,
                 stats.min_fps,
                 stats.max_fps,
@@ -475,6 +507,31 @@ impl<'a> State<'a> {
             );
             self.uniform_binding
                 .write(&self.queue, &self.current_uniforms);
+        }
+
+        // ── Benchmark tick ────────────────────────────────────────────────────
+        // Runs after the uniforms are updated so the last frame of a step still
+        // renders the correct cube count before the machine advances.
+        if let Some(bench) = self.benchmark.as_mut() {
+            let just_done = bench.tick(
+                self.pacing_decay,
+                self.stutter_decay,
+                self.vblank_mul_ema,
+                self.any_vblank_miss_this_frame,
+            );
+
+            if just_done {
+                self.benchmark_done = true;
+            } else {
+                // Hot-patch the cube count in the live uniform without waiting
+                // for the next 500ms metrics tick.
+                let new_count = bench.current_cubes;
+                if self.current_uniforms.cube_count != new_count {
+                    self.current_uniforms.cube_count = new_count;
+                    self.uniform_binding
+                        .write(&self.queue, &self.current_uniforms);
+                }
+            }
         }
 
         Ok(())
