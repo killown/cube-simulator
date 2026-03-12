@@ -123,7 +123,7 @@ impl<'a> State<'a> {
             let ts = adapter.get_presentation_timestamp();
             if ts.is_invalid() {
                 eprintln!(
-                    "WARN: Backend does not support presentation timestamps — \
+                    "WARN: Backend does not support presentation timestamps, \
                      jitter/FTV will use CPU timers (compositor-schedulable)"
                 );
                 false
@@ -190,7 +190,7 @@ impl<'a> State<'a> {
         let frame_log_file = args.frame_log.as_ref().and_then(|path| {
             if !hw_timestamps_available {
                 eprintln!(
-                    "WARN: --frame-log requested but backend has no HW timestamps — skipping"
+                    "WARN: --frame-log requested but backend has no HW timestamps, skipping"
                 );
                 return None;
             }
@@ -200,7 +200,7 @@ impl<'a> State<'a> {
                 .append(true)
                 .open(path)
                 .unwrap();
-            let _ = writeln!(f, "# frame,ts_ns,delta_ms,ideal_ms,drift_ms,sync");
+            let _ = writeln!(f, "# frame,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms]");
             Some(f)
         });
 
@@ -329,10 +329,30 @@ impl<'a> State<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        // Capture CPU-domain submit timestamp immediately after the driver has
+        // accepted the command buffer. On Linux, std::time::Instant uses
+        // CLOCK_MONOTONIC, the same epoch as WSI presentation timestamps, so the
+        // gap (ts_ns − cpu_submit_ns) is a meaningful submit-to-scanout latency.
+        let cpu_submit_ns = {
+            let mono = std::time::Instant::now();
+            // Convert to CLOCK_MONOTONIC nanoseconds via the process-start anchor.
+            // `frame_start` was sampled at the top of render(); its elapsed() gives
+            // the offset from that anchor to now, which we add to the anchor's own
+            // CLOCK_MONOTONIC value.  Since we have no direct CLOCK_MONOTONIC syscall
+            // in std, we derive the anchor from the WSI timestamp sampled last frame
+            // if available; otherwise we leave cpu_submit_ns as None so slack_ms is
+            // simply omitted for this frame rather than being wrong.
+            self.last_pres_ts.map(|prev_ts_ns| {
+                // Time elapsed from the previous WSI sample point to right now.
+                let since_last_wsi = mono.duration_since(frame_start).as_nanos() as u64;
+                prev_ts_ns + since_last_wsi
+            })
+        };
         output.present();
+        let cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
 
         // Sample the WSI clock after present(). On DRM/KMS+Vulkan backends this
-        // is CLOCK_MONOTONIC nanoseconds from the presentation engine — the same
+        // is CLOCK_MONOTONIC nanoseconds from the presentation engine, the same
         // domain as vblank timestamps. Computing deltas between consecutive samples
         // gives inter-frame intervals that compositor scheduling (max_render_time,
         // frame callbacks) cannot fabricate, because the clock ticks independently
@@ -363,7 +383,7 @@ impl<'a> State<'a> {
                 // Feed the raw timestamp into the pacing analyzer before the
                 // 500ms tick gate so every individual frame's phase drift and
                 // sync score are captured and logged at full frame resolution.
-                if let Some(record) = self.pacing.push(now_ns) {
+                if let Some(record) = self.pacing.push(now_ns, Some(cpu_frame_ms), cpu_submit_ns) {
                     write_frame_log_row(&mut self.frame_log_file, &record);
                 }
 

@@ -35,30 +35,94 @@ pub struct TickStats {
 
 /// A single frame's pacing record derived from hardware presentation timestamps.
 ///
-/// Captures the exact moment a frame was scanned out by the display engine,
-/// how far it drifted from its ideal vblank slot, and a normalised sync score.
+/// Every field is annotated with the compositor-development question it answers.
+/// CPU-domain fields (`cpu_frame_ms`, `slack_ms`) are explicitly marked; all
+/// timestamp fields originate from the WSI/KMS clock (CLOCK_MONOTONIC domain).
 #[derive(Debug, Clone, Copy)]
 pub struct FramePacingRecord {
-    /// Absolute KMS/WSI presentation timestamp of this frame (nanoseconds).
+    /// Frame sequence number since the analyzer was created (0-based).
+    pub frame_index: u64,
+
+    // ── Presentation clock ───────────────────────────────────────────────────
+    /// Absolute KMS/WSI presentation timestamp for this frame (nanoseconds).
+    ///
+    /// Directly comparable to `wl_surface.frame` callback timestamps and
+    /// `DRM_IOCTL_WAIT_VBLANK` reply timestamps, same CLOCK_MONOTONIC epoch.
     pub timestamp_ns: u64,
-    /// Measured inter-frame interval for this frame (milliseconds).
+
+    /// Measured inter-frame interval on the presentation clock (milliseconds).
+    ///
+    /// The only timing metric that cannot be fabricated by compositor scheduling.
     pub delta_ms: f32,
-    /// Target vblank period derived from the monitor's refresh rate (milliseconds).
+
+    /// Target vblank period from the monitor's reported refresh rate (milliseconds).
     pub ideal_ms: f32,
+
+    // ── Vblank grid alignment ────────────────────────────────────────────────
     /// Signed deviation from the nearest ideal vblank boundary (milliseconds).
     ///
     /// Positive = frame arrived late (missed its slot, presented on next vblank).
     /// Negative = frame arrived early (unlikely on vsync'd paths; possible on Immediate).
-    /// The magnitude is clamped to `ideal_ms / 2` so it always represents the
-    /// closest boundary, not an accumulated offset.
+    /// Clamped to `±(ideal_ms / 2)` so it always names the *nearest* boundary, not
+    /// an accumulated offset, a value of +8 ms on a 16 ms budget means one half-period
+    /// late, regardless of how many previous frames drifted.
     pub phase_drift_ms: f32,
+
+    /// Raw signed drift in nanoseconds before float truncation.
+    ///
+    /// Retains sub-microsecond precision lost in `phase_drift_ms` (~100 ns at 120 Hz).
+    /// Use this when feeding drift into a PLL or repaint-timer correction loop.
+    pub phase_drift_ns: i64,
+
+    /// How many vblank periods this frame consumed.
+    ///
+    /// `1` = on time.  `2` = one vblank dropped (GPU overran or compositor missed
+    /// deadline).  `≥ 3` = severe stall (TTM eviction, GPU preemption, thermal
+    /// throttle).  Derived as `max(1, round(delta_ms / ideal_ms))`.
+    pub vblank_mul: u32,
+
     /// Normalised frame sync quality: 100 = perfectly on-vblank, 0 = half-period drift.
     ///
-    /// Computed as `100 × (1 − |phase_drift| / (ideal_ms / 2))`, clamped to `[0, 100]`.
-    /// A score ≥ 95 is considered perceptually indistinguishable from perfect pacing.
+    /// `100 × (1 − |phase_drift_ms| / (ideal_ms / 2))`, clamped to `[0, 100]`.
+    /// ≥ 95 is perceptually indistinguishable from perfect pacing on all display types.
     pub sync_score: f32,
-    /// Frame sequence number since the analyzer was created (0-based).
-    pub frame_index: u64,
+
+    // ── Instantaneous jitter ─────────────────────────────────────────────────
+    /// Change in inter-frame interval relative to the previous frame (milliseconds).
+    ///
+    /// `delta_ms[n] − delta_ms[n−1]`.  Detects double-buffer ping-pong
+    /// (alternating fast/slow frames that cancel out in the rolling jitter average
+    /// but are clearly visible on screen).  `None` on the first valid frame.
+    pub ipc_delta_ms: Option<f32>,
+
+    // ── CPU-domain work cycle ─────────────────────────────────────────────────
+    /// Total CPU-observed frame time: `RedrawRequested` → `present()` return
+    /// (milliseconds, CPU `Instant`, not the presentation clock).
+    ///
+    /// Compare against `delta_ms` (presentation clock) to diagnose buffer-hold policy:
+    /// - `delta_ms ≈ cpu_frame_ms` → frame was scanned out immediately after CPU work.
+    /// - `delta_ms >> cpu_frame_ms` → compositor held the buffer (`max_render_time`
+    ///   inflation, triple-buffer queue depth > 1, Wayland frame-callback throttling).
+    /// - `delta_ms < cpu_frame_ms` → impossible on vsync'd paths; indicates clock skew.
+    ///
+    /// `None` when not supplied to [`PacingAnalyzer::push`].
+    pub cpu_frame_ms: Option<f32>,
+
+    /// Time from CPU-observed `queue.submit()` return to the hardware presentation
+    /// timestamp (milliseconds, mixed CPU + HW domain).
+    ///
+    /// Approximates GPU execution + driver flip pipeline depth as seen from the CPU.
+    /// On a healthy single-vblank Fifo path: `slack_ms ≈ ideal_ms`.
+    ///
+    /// Cross-reference with `phase_drift_ms` to locate the bottleneck:
+    /// - `drift high` + `slack high` → GPU finished well before vblank; buffer sat in
+    ///   the compositor's queue, **compositor scheduling policy** is the bottleneck.
+    /// - `drift high` + `slack ≈ 0`  → GPU was still executing at vblank time —
+    ///   **GPU render budget** was exceeded.
+    /// - `drift low`  + `slack ≈ ideal_ms` → healthy, one-vblank pipeline.
+    ///
+    /// `None` when `cpu_submit_ns` was not supplied to [`PacingAnalyzer::push`].
+    pub slack_ms: Option<f32>,
 }
 
 /// Stateful per-frame pacing analyzer driven by hardware presentation timestamps.
@@ -73,6 +137,13 @@ pub struct PacingAnalyzer {
     phase_origin_ns: Option<u64>,
     /// Previous valid presentation timestamp for delta computation.
     prev_ts_ns: Option<u64>,
+    /// `delta_ms` from the previous frame, for instantaneous jitter (`ipc_delta_ms`).
+    prev_delta_ms: Option<f32>,
+    /// CPU-domain nanoseconds of the previous frame's `queue.submit()` return.
+    ///
+    /// Stored one frame behind because the presentation timestamp for a given submit
+    /// arrives on the *next* `push()` call, not the same one.
+    prev_cpu_submit_ns: Option<u64>,
     /// Monotonically increasing frame counter.
     frame_index: u64,
 }
@@ -88,19 +159,34 @@ impl PacingAnalyzer {
             ideal_period_ns: (frame_budget_ms * 1_000_000.0).round() as u64,
             phase_origin_ns: None,
             prev_ts_ns: None,
+            prev_delta_ms: None,
+            prev_cpu_submit_ns: None,
             frame_index: 0,
         }
     }
 
-    /// Ingests one hardware presentation timestamp and returns a pacing record.
+    /// Ingests one frame's timing data and returns a fully-populated pacing record.
     ///
     /// Returns `None` for the very first frame (no delta available yet) or when
-    /// the delta is outside the plausible range `(0, 1000ms)` — which indicates
-    /// a clock discontinuity (suspend/resume, VT switch).
+    /// `delta_ms` is outside the plausible range `(0, 1000 ms)`, which indicates a
+    /// clock discontinuity (suspend/resume, VT switch, DPMS wakeup).
     ///
     /// # Arguments
-    /// * `ts_ns` — Raw KMS/WSI nanosecond timestamp from the presentation engine.
-    pub fn push(&mut self, ts_ns: u64) -> Option<FramePacingRecord> {
+    /// * `ts_ns` Raw KMS/WSI nanosecond timestamp from
+    ///   `adapter.get_presentation_timestamp()`.  Must be CLOCK_MONOTONIC domain.
+    /// * `cpu_frame_ms`, CPU-observed total frame time (`RedrawRequested` →
+    ///   `present()` return), in milliseconds.  `None` if not measured.
+    /// * `cpu_submit_ns`, `std::time::Instant` converted to nanoseconds, sampled
+    ///   immediately after `queue.submit()` returns for **this** frame.  Stored and
+    ///   matched against the **next** frame's `ts_ns` to derive `slack_ms`, because
+    ///   the hardware presentation timestamp for a given submit arrives one frame later.
+    ///   `None` if not measured.
+    pub fn push(
+        &mut self,
+        ts_ns: u64,
+        cpu_frame_ms: Option<f32>,
+        cpu_submit_ns: Option<u64>,
+    ) -> Option<FramePacingRecord> {
         let idx = self.frame_index;
         self.frame_index += 1;
 
@@ -111,6 +197,8 @@ impl PacingAnalyzer {
 
         if delta_ms <= 0.0 || delta_ms >= 1000.0 {
             self.phase_origin_ns = None;
+            self.prev_delta_ms = None;
+            self.prev_cpu_submit_ns = cpu_submit_ns;
             return None;
         }
 
@@ -128,13 +216,42 @@ impl PacingAnalyzer {
         let half_period_ms = self.ideal_period_ns as f32 / 2_000_000.0;
         let sync_score = (100.0 * (1.0 - drift_ms.abs() / half_period_ms)).clamp(0.0, 100.0);
 
+        // `round()` gives the true number of vblank periods consumed: 1 = on-time,
+        // 2 = one dropped, etc. `max(1)` guards against sub-frame deltas on
+        // Immediate mode where `delta_ms < ideal_ms` is valid.
+        let vblank_mul =
+            ((delta_ms / (self.ideal_period_ns as f32 / 1_000_000.0)).round() as u32).max(1);
+
+        let ipc_delta_ms = self.prev_delta_ms.map(|prev_d| delta_ms - prev_d);
+
+        // `prev_cpu_submit_ns` is the submit timestamp from the *previous* frame,
+        // which is what produced this frame's scanout.  `ts_ns` and `cpu_submit_ns`
+        // are both CLOCK_MONOTONIC on Linux, making the subtraction meaningful despite
+        // the mixed capture method (WSI vs. std::time::Instant).
+        let slack_ms = self.prev_cpu_submit_ns.and_then(|submit_ns| {
+            let gap_ns = ts_ns.saturating_sub(submit_ns);
+            let gap_ms = gap_ns as f32 / 1_000_000.0;
+            // Discard values outside [0, 5 × ideal]: negative = clock skew,
+            // extreme positive = submit timestamp predates WSI origin or stale value.
+            let ceiling = (self.ideal_period_ns as f32 / 1_000_000.0) * 5.0;
+            (gap_ms > 0.0 && gap_ms < ceiling).then_some(gap_ms)
+        });
+
+        self.prev_delta_ms = Some(delta_ms);
+        self.prev_cpu_submit_ns = cpu_submit_ns;
+
         Some(FramePacingRecord {
+            frame_index: idx,
             timestamp_ns: ts_ns,
             delta_ms,
             ideal_ms: self.ideal_period_ns as f32 / 1_000_000.0,
             phase_drift_ms: drift_ms,
+            phase_drift_ns: drift_ns,
+            vblank_mul,
             sync_score,
-            frame_index: idx,
+            ipc_delta_ms,
+            cpu_frame_ms,
+            slack_ms,
         })
     }
 }
@@ -316,7 +433,7 @@ impl FrameMetrics {
 
     // FTV (Frame Time Variance %): coefficient of variation of frame times within
     // the rolling window, expressed as a percentage. Measures how evenly frames
-    // are spaced across the 1000ms budget — 0% is perfectly uniform delivery,
+    // are spaced across the 1000ms budget, 0% is perfectly uniform delivery,
     // high values mean frames are bunching (some very fast, some very slow),
     // which the eye perceives as judder even when mean FPS looks acceptable.
     // e.g. frames of [5ms, 48ms, 6ms, 47ms] at "~20fps" will look skippy
@@ -385,26 +502,55 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 
 /// Writes one NDJSON line for a single frame's pacing record, if a file handle is present.
 ///
-/// Emitted once per frame (not per tick), providing microsecond-resolution insight
+/// Emitted once per frame (not per tick), providing nanosecond-resolution insight
 /// into how each individual frame landed relative to the ideal vblank grid.
-/// Fields:
-/// - `frame`: monotonic frame index since session start
-/// - `ts_ns`: raw hardware presentation timestamp (nanoseconds, CLOCK_MONOTONIC domain)
-/// - `delta_ms`: measured inter-frame interval
-/// - `ideal_ms`: target vblank period from monitor refresh rate
-/// - `drift_ms`: signed deviation from nearest vblank boundary (+ = late, − = early)
-/// - `sync`: 0–100 quality score (100 = perfectly on-vblank)
+///
+/// # Fields emitted
+/// - `frame`        — monotonic frame index since session start
+/// - `ts_ns`        — raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
+/// - `delta_ms`     — measured inter-frame interval on the presentation clock
+/// - `ideal_ms`     — target vblank period from monitor refresh rate
+/// - `drift_ms`     — signed deviation from nearest vblank boundary (+ = late, − = early)
+/// - `drift_ns`     — same drift at nanosecond precision (for PLL / repaint-timer use)
+/// - `vblank_mul`   — vblank periods consumed (1 = on-time, 2 = one dropped, ≥3 = stall)
+/// - `sync`         — 0–100 quality score (100 = perfectly on-vblank)
+/// - `ipc_delta_ms` — instantaneous Δ between this and the previous `delta_ms`;
+///                    detects double-buffer ping-pong invisible to rolling averages
+/// - `cpu_frame_ms` — CPU-observed total frame time; compare with `delta_ms` to
+///                    detect compositor buffer-hold (`delta >> cpu` = held in queue)
+/// - `slack_ms`     — `present_ts − submit_cpu`: GPU execution + flip pipeline depth;
+///                    `drift high + slack high` = compositor policy bottleneck;
+///                    `drift high + slack ≈ 0` = GPU budget overrun
+///
+/// Optional fields (`ipc_delta_ms`, `cpu_frame_ms`, `slack_ms`) are omitted from
+/// the JSON object entirely when `None`, keeping the log compact and grep-friendly.
 pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord) {
-    if let Some(f) = file {
-        let _ = writeln!(
-            f,
-            r#"{{"frame":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"sync":{:.2}}}"#,
-            record.frame_index,
-            record.timestamp_ns,
-            record.delta_ms,
-            record.ideal_ms,
-            record.phase_drift_ms,
-            record.sync_score,
-        );
+    let Some(f) = file else { return };
+
+    // Mandatory fields, always present.
+    let _ = write!(
+        f,
+        r#"{{"frame":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
+        record.frame_index,
+        record.timestamp_ns,
+        record.delta_ms,
+        record.ideal_ms,
+        record.phase_drift_ms,
+        record.phase_drift_ns,
+        record.vblank_mul,
+        record.sync_score,
+    );
+
+    // Optional fields, emitted only when the caller supplied the source data.
+    if let Some(v) = record.ipc_delta_ms {
+        let _ = write!(f, r#","ipc_delta_ms":{:.4}"#, v);
     }
+    if let Some(v) = record.cpu_frame_ms {
+        let _ = write!(f, r#","cpu_frame_ms":{:.4}"#, v);
+    }
+    if let Some(v) = record.slack_ms {
+        let _ = write!(f, r#","slack_ms":{:.4}"#, v);
+    }
+
+    let _ = writeln!(f, "}}");
 }

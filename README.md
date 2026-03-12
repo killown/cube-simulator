@@ -45,13 +45,40 @@ To get accurate metrics, you must compile with the release profile to minimize C
 
 ### Low-Level Telemetry (`--frame-log`)
 
-The `.json` frame log provides microsecond-resolution insight for every scanout event using kernel-level timestamps (`CLOCK_MONOTONIC`). This bypasses compositor scheduling to reveal true hardware pacing:
+The `.json` frame log provides nanosecond-resolution insight for every scanout event using kernel-level timestamps (`CLOCK_MONOTONIC`). This bypasses compositor scheduling to reveal true hardware pacing.
 
-- **ts_ns:** Raw hardware presentation timestamp in nanoseconds. This is the exact moment the display hardware (KMS) finished the page flip.
-- **delta_ms:** Actual time elapsed between physical display updates.
-- **ideal_ms:** The target interval based on the monitor's physical hardware refresh rate (e.g., 6.06ms for 165Hz).
-- **drift_ms:** Signed deviation from the nearest vblank boundary (+ is late, - is early).
-- **sync:** Quality score (0-100). **100** means the frame landed exactly on a vblank pulse.
+Optional fields (`ipc_delta_ms`, `cpu_frame_ms`, `slack_ms`) are omitted from a record entirely when the backend cannot supply the required source data, never defaulted to zero.
+
+- **`ts_ns`** — Absolute KMS/WSI presentation timestamp in nanoseconds (`CLOCK_MONOTONIC`). The exact moment the display hardware finished the page flip. Directly comparable to `wl_surface.frame` callback timestamps and `DRM_IOCTL_WAIT_VBLANK` reply timestamps, same clock epoch.
+
+- **`delta_ms`** — Actual time elapsed between consecutive hardware scan-outs, measured entirely on the presentation clock. The only timing value in the log that compositor scheduling policy (`max_render_time`, Wayland frame callbacks) cannot fabricate.
+
+- **`ideal_ms`** — Target vblank period derived from the monitor's reported hardware refresh rate (e.g. `6.0606 ms` at 165 Hz). Constant within a session; sourced from DRM connector data when available, falling back to the winit monitor query.
+
+- **`drift_ms`** — Signed deviation from the nearest ideal vblank boundary. `+` = late (frame missed its slot and was held to the next vblank). `−` = early (rare on vsync'd paths; possible in Immediate mode). Always clamped to `±(ideal_ms / 2)` so it names the _nearest_ boundary regardless of accumulated offset, a value of `+8 ms` on a 16 ms budget means one half-period late, not a frame that has been accumulating drift for 8 ms.
+
+- **`drift_ns`** — The same signed drift as `drift_ms` but at raw nanosecond precision, before float truncation. `drift_ms` loses approximately 100 ns of precision per frame at 120 Hz. Use `drift_ns` when feeding this signal into a PLL or repaint-timer correction loop where sub-microsecond accuracy matters.
+
+- **`vblank_mul`** — How many vblank periods this frame consumed, derived as `max(1, round(delta_ms / ideal_ms))`. `1` = on time. `2` = one vblank dropped (GPU overran its budget or compositor missed its deadline). `≥ 3` = severe stall (TTM eviction, GPU preemption, thermal throttle). Reading this directly from the log is faster than computing it manually from `delta_ms / ideal_ms`.
+
+- **`sync`** — Frame sync quality score 0–100. Computed as `100 × (1 − |drift_ms| / (ideal_ms / 2))`, clamped to `[0, 100]`. `100` means the frame landed exactly on a vblank pulse. `0` means it landed at the worst possible point, exactly halfway between two vblank boundaries. Scores ≥ 95 are perceptually indistinguishable from perfect pacing on all display types.
+
+- **`ipc_delta_ms`** _(optional)_ — Instantaneous inter-frame interval change: `delta_ms[n] − delta_ms[n−1]`. This is the raw per-frame jitter signal, distinct from the rolling jitter average reported in the tick log. Its primary use is detecting double-buffer ping-pong: a compositor locked into alternating fast/slow delivery (e.g. 7 ms / 11 ms / 7 ms / 11 ms) will produce a systematic sign-alternation in `ipc_delta_ms` that rolling averages partially cancel out but is clearly visible here. Absent on the first valid frame.
+
+- **`cpu_frame_ms`** _(optional)_ — CPU-observed total frame time from `RedrawRequested` to `present()` return, in milliseconds. This is a `std::time::Instant` measurement, **not** the presentation clock. Cross-reference with `delta_ms` to diagnose buffer-hold behaviour:
+  - `delta_ms ≈ cpu_frame_ms` → frame was scanned out immediately after the CPU finished work.
+  - `delta_ms >> cpu_frame_ms` → the GPU finished on time but the compositor held the ready buffer, indicative of an overly conservative `max_render_time` policy, a triple-buffer queue deeper than 1, or Wayland frame-callback throttling.
+  - `delta_ms < cpu_frame_ms` → impossible on vsync'd paths; indicates clock skew between the CPU and WSI domains.
+
+- **`slack_ms`** _(optional)_ — Time from CPU-observed `queue.submit()` return to the hardware presentation timestamp, in milliseconds. Approximates GPU execution time plus driver flip pipeline depth as seen from the CPU timeline. On a healthy single-vblank Fifo path, `slack_ms ≈ ideal_ms`. Cross-reference with `drift_ms` to locate the bottleneck:
+
+  | `drift_ms` | `slack_ms`   | Diagnosis                                                                                                                 |
+  | ---------- | ------------ | ------------------------------------------------------------------------------------------------------------------------- |
+  | High       | High         | GPU finished well before vblank; buffer sat in the compositor's queue, **compositor scheduling policy** is the bottleneck |
+  | High       | ≈ 0          | GPU was still executing at vblank time, **GPU render budget** was exceeded                                                |
+  | Low        | ≈ `ideal_ms` | Healthy one-vblank pipeline                                                                                               |
+
+---
 
 ### Present Mode Diagnostics
 
