@@ -22,7 +22,7 @@ These benchmarks measure frame presentation stability and consistency.
 
 JAY and Sway with (max render time 10) consistently presents the same safe cube count and sometimes with very little variation of 1 or 2 cubes. Others can vary by up to 20 cubes, never exceeding 41. Most compositors, however, rarely reach 20 cubes in most attempts, some never exceed 30.
 
-It doesn't measure the average maximum safe cube count, but it reveals that 99% of compositors have a big room to improve frame presentation stability when the GPU is under high load. Jay seems the only one among all that has this level of performance and consistency.
+It doesn't measure the average maximum safe cube count, but it reveals that 99% of compositors have a big room to improve frame presentation stability when the GPU is under high load. 
 
 # What are we measuring?
 
