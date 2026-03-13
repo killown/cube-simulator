@@ -120,7 +120,7 @@ The benchmark automatically sweeps cube counts from `1` up to `--bench-max`, hol
   Signal         : RED — sustained EMA pressure (red diamond)
   Measured for   : 0.0s before trigger
 
-➜ Maximum safe cube count: 15
+➜ Maximum safe cube count: 38
 ```
 
 **Mailbox**
