@@ -212,19 +212,19 @@ The benchmark automatically sweeps cube counts from `1` up to `--bench-max`, hol
 **FIFO**
 
 ```
-✗ Trigger at     : 42 cubes
-  Signal         : RED — sustained EMA pressure (red diamond)
-  Measured for   : 0.0s before trigger
-
-➜ Maximum safe cube count: 41
-```
-
-**Mailbox**
-
-```
 ✗ Trigger at     : 31 cubes
   Signal         : YELLOW — isolated vblank miss (amber ring)
   Measured for   : 0.8s before trigger
 
 ➜ Maximum safe cube count: 30
+```
+
+**Mailbox**
+
+```
+✗ Trigger at     : 42 cubes
+  Signal         : RED — sustained EMA pressure (red diamond)
+  Measured for   : 0.0s before trigger
+
+➜ Maximum safe cube count: 41
 ```
