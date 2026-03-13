@@ -135,12 +135,12 @@ The benchmark automatically sweeps cube counts from `1` up to `--bench-max`, hol
 
 ---
 
-## Sway
+## Sway (max render time: 10, wlroots(await-completion))
 
 **FIFO**
 
 ```
-✗ Trigger at     : 16 cubes
+✗ Trigger at     : 39 cubes
   Signal         : RED — sustained EMA pressure (red diamond)
   Measured for   : 0.0s before trigger
 
@@ -183,7 +183,7 @@ The benchmark automatically sweeps cube counts from `1` up to `--bench-max`, hol
 
 ---
 
-## Wayfire (Vulkan)
+## Wayfire (Vulkan: max render time -1)
 
 **FIFO**
 
@@ -207,7 +207,7 @@ The benchmark automatically sweeps cube counts from `1` up to `--bench-max`, hol
 
 ---
 
-## Wayfire (GLES2)
+## Wayfire (GLES2: Max render time -1)
 
 **FIFO**
 
