@@ -20,7 +20,7 @@ These benchmarks measure frame presentation stability and consistency.
 
 # Note
 
-JAY consistently presents the same safe cube count and sometimes with very little variation of 1 or 2 cubes. Others can vary by up to 20 cubes, never exceeding 41. Most compositors, however, rarely reach 20 cubes in most attempts, some never exceed 30.
+JAY and Sway with (max render time 10) consistently presents the same safe cube count and sometimes with very little variation of 1 or 2 cubes. Others can vary by up to 20 cubes, never exceeding 41. Most compositors, however, rarely reach 20 cubes in most attempts, some never exceed 30.
 
 It doesn't measure the average maximum safe cube count, but it reveals that 99% of compositors have a big room to improve frame presentation stability when the GPU is under high load. Jay seems the only one among all that has this level of performance and consistency.
 
@@ -105,30 +105,6 @@ The benchmark automatically sweeps cube counts from `1` up to `--bench-max`, hol
 ✗ Trigger at     : 24 cubes
   Signal         : YELLOW — isolated vblank miss (amber ring)
   Measured for   : 0.5s before trigger
-
-➜ Maximum safe cube count: 23
-```
-
----
-
-## Hyprland
-
-**FIFO**
-
-```
-✗ Trigger at     : 40 cubes
-  Signal         : RED — sustained EMA pressure (red diamond)
-  Measured for   : 0.0s before trigger
-
-➜ Maximum safe cube count: 39
-```
-
-**Mailbox**
-
-```
-✗ Trigger at     : 24 cubes
-  Signal         : YELLOW — isolated vblank miss (amber ring)
-  Measured for   : 0.0s before trigger
 
 ➜ Maximum safe cube count: 23
 ```
