@@ -70,6 +70,32 @@ pub struct State<'a> {
     gpu_timer: GpuTimer,
 }
 
+/// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
+/// syscall, placing it in the same epoch as WSI/KMS presentation timestamps so
+/// that `submit_ns, present_ts` produces an accurate `slack_ms` without any
+/// anchor arithmetic.
+///
+/// Falls back to `0` only on platforms where the syscall is unavailable; the
+/// caller treats `0` as `None` in the pacing filter (`gap_ms > 0.0`).
+#[cfg(target_os = "linux")]
+#[inline]
+fn clock_monotonic_ns() -> u64 {
+    // SAFETY: `timespec` is zero-initialised before the syscall writes it;
+    // `CLOCK_MONOTONIC` (1) is a valid, always-present clock id on Linux.
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn clock_monotonic_ns() -> u64 {
+    0
+}
+
 impl<'a> State<'a> {
     /// Initialises the full wgpu stack, selects surface format and present mode,
     /// compiles the shader, and builds the render pipeline.
@@ -134,6 +160,10 @@ impl<'a> State<'a> {
 
         println!("Surface Format: {:?}", surface_format);
         println!("Present Mode: {:?}", present_mode);
+        println!(
+            "Frame Latency: {} (desired_maximum_frame_latency)",
+            args.latency
+        );
 
         if present_mode == wgpu::PresentMode::Fifo {
             println!("NOTE: In Fifo mode, the driver and compositor handle synchronization");
@@ -249,7 +279,7 @@ impl<'a> State<'a> {
                 .append(true)
                 .open(path)
                 .unwrap();
-            let _ = writeln!(f, "# schema:1 frame,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms][,gpu_time_ms]");
+            let _ = writeln!(f, "# schema:2 frame,cube_count,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms][,gpu_time_ms]");
             Some(f)
         });
 
@@ -271,7 +301,7 @@ impl<'a> State<'a> {
             present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: args.latency,
         };
         surface.configure(&device, &config);
 
@@ -384,6 +414,14 @@ impl<'a> State<'a> {
         self.pacing_decay = (self.pacing_decay - PACING_DECAY_RATE).max(0.0);
         self.any_vblank_miss_this_frame = false;
 
+        // Flush pending wgpu callbacks (including the map_async completion for the
+        // previous frame's timestamp readback) before draining the gpu_timer state
+        // machine. With latency=1 the swapchain does not block long enough for the
+        // Vulkan driver to fire the callback on its own; a non-blocking Poll here
+        // guarantees the Mapped state is visible to gpu_timer.poll() below without
+        // stalling the CPU.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
         // Drain the async readback from the previous frame. Must happen before
         // resolve() overwrites the readback buffer with frame N-1's queries.
         self.gpu_timer.poll();
@@ -436,24 +474,10 @@ impl<'a> State<'a> {
         // available the next time gpu_timer.poll() runs (top of next frame).
         self.gpu_timer.arm_readback();
         // Capture CPU-domain submit timestamp immediately after the driver has
-        // accepted the command buffer. On Linux, std::time::Instant uses
-        // CLOCK_MONOTONIC, the same epoch as WSI presentation timestamps, so the
-        // gap (ts_ns − cpu_submit_ns) is a meaningful submit-to-scanout latency.
-        let cpu_submit_ns = {
-            let mono = std::time::Instant::now();
-            // Convert to CLOCK_MONOTONIC nanoseconds via the process-start anchor.
-            // `frame_start` was sampled at the top of render(); its elapsed() gives
-            // the offset from that anchor to now, which we add to the anchor's own
-            // CLOCK_MONOTONIC value.  Since we have no direct CLOCK_MONOTONIC syscall
-            // in std, we derive the anchor from the WSI timestamp sampled last frame
-            // if available; otherwise we leave cpu_submit_ns as None so slack_ms is
-            // simply omitted for this frame rather than being wrong.
-            self.last_pres_ts.map(|prev_ts_ns| {
-                // Time elapsed from the previous WSI sample point to right now.
-                let since_last_wsi = mono.duration_since(frame_start).as_nanos() as u64;
-                prev_ts_ns + since_last_wsi
-            })
-        };
+        // accepted the command buffer. Uses CLOCK_MONOTONIC directly via libc so
+        // the value is in the same nanosecond epoch as WSI presentation timestamps
+        // without any anchor arithmetic or accumulated error.
+        let cpu_submit_ns = clock_monotonic_ns();
         output.present();
         let cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -498,10 +522,14 @@ impl<'a> State<'a> {
                 // sync score are captured and logged at full frame resolution.
                 pacing_record =
                     self.pacing
-                        .push(now_ns, Some(cpu_frame_ms), cpu_submit_ns, gpu_time_ms);
+                        .push(now_ns, Some(cpu_frame_ms), Some(cpu_submit_ns), gpu_time_ms);
 
                 if let Some(record) = &pacing_record {
-                    write_frame_log_row(&mut self.frame_log_file, record);
+                    let live_cube_count = self
+                        .benchmark
+                        .as_ref()
+                        .map_or(self.args.cubes, |b| b.current_cubes);
+                    write_frame_log_row(&mut self.frame_log_file, record, live_cube_count);
 
                     // Any single missed vblank is a yellow warning, a momentary ping.
                     if record.vblank_mul > 1 {

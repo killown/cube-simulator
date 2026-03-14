@@ -84,15 +84,22 @@ impl BenchmarkState {
         }
     }
 
-    /// Called every frame.  `pacing_decay` and `stutter_decay` mirror the live
-    /// values maintained by `State` (yellow and red signals respectively).
+    /// Called every frame.  `pacing_decay` carries the yellow (momentary vblank
+    /// miss) signal and `stutter_decay` carries the red (sustained EMA pressure)
+    /// signal, mirroring the field semantics in `State`.
+    ///
+    /// `vblank_mul_ema` is informational only and is no longer used for trigger
+    /// logic here: `stutter_decay` is already set to `1.0` in the renderer
+    /// whenever `vblank_mul_ema > PACING_EMA_THRESHOLD`, so testing the EMA
+    /// again here would double-count the same condition.
+    ///
     /// Returns `true` when the benchmark has just transitioned to done, so the
     /// caller knows to request an event-loop exit after this frame.
     pub fn tick(
         &mut self,
         pacing_decay: f32,
         stutter_decay: f32,
-        vblank_mul_ema: f32,
+        _vblank_mul_ema: f32,
         any_vblank_miss: bool,
     ) -> bool {
         if self.done {
@@ -118,7 +125,11 @@ impl BenchmarkState {
                 .duration_since(self.measure_start.unwrap())
                 .as_secs_f32();
 
-            let trigger = if stutter_decay >= 1.0 || vblank_mul_ema > 1.15 {
+            // Red: sustained EMA pressure, stutter_decay is set to 1.0 in the
+            // renderer whenever vblank_mul_ema > PACING_EMA_THRESHOLD, so a
+            // value ≥ 1.0 here means the EMA threshold was crossed this frame.
+            // Yellow: any single vblank miss, pacing_decay or the per-frame flag.
+            let trigger = if stutter_decay >= 1.0 {
                 Some(BenchTrigger::Red)
             } else if pacing_decay >= 1.0 || any_vblank_miss {
                 Some(BenchTrigger::Yellow)

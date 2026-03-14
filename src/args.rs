@@ -33,6 +33,17 @@ pub struct Args {
     /// Run without this flag to print all active connectors and their modes.
     #[arg(long)]
     pub connector: Option<String>,
+    /// Swapchain frame latency (desired_maximum_frame_latency).
+    ///
+    /// Controls how many frames the compositor may buffer ahead of scanout.
+    /// `2` (default) matches the wgpu default and gives the async GPU timestamp
+    /// readback enough pipeline depth to complete before the next frame calls
+    /// `gpu_timer.poll()`, keeping the GPU OSD field populated. `1` reduces
+    /// input latency but risks the readback not completing in time, leaving
+    /// `gpu_time_ms` as zero until a `device.poll()` catches up. Values above
+    /// `3` inflate all delivery-pressure metrics with no practical benefit.
+    #[arg(long, default_value_t = 2)]
+    pub latency: u32,
     /// Enable compositor stress benchmark mode.
     ///
     /// Tests cube counts 1, 2, 3, … N seconds each. The first `--bench-warmup`

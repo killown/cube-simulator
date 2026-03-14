@@ -309,8 +309,13 @@ impl FrameMetrics {
     /// Creates a new `FrameMetrics` instance seeded with the monitor's frame budget.
     pub fn new(frame_budget_ms: f32) -> Self {
         let now = std::time::Instant::now();
+        // Cap the ring to 30 seconds of frames at the reported refresh rate.
+        // A fixed count of 3600 is only ~15 s at 240 Hz and ~2 min at 30 Hz;
+        // tying the cap to the frame budget gives a consistent analysis window
+        // regardless of refresh rate.
+        let ring_cap = ((30_000.0 / frame_budget_ms).ceil() as usize).max(256);
         Self {
-            frame_times: VecDeque::with_capacity(3600),
+            frame_times: VecDeque::with_capacity(ring_cap),
             frame_budget_ms,
             frame_count: 0,
             dropped_frames: 0,
@@ -318,7 +323,7 @@ impl FrameMetrics {
             min_fps: 0.0,
             max_fps: 0.0,
             last_fps_update: now,
-            presentation_timestamps: VecDeque::with_capacity(3600),
+            presentation_timestamps: VecDeque::with_capacity(ring_cap),
             hw_timestamps_available: false,
         }
     }
@@ -350,13 +355,15 @@ impl FrameMetrics {
             self.dropped_frames += (delta_ms / self.frame_budget_ms).floor() as u32;
         }
 
+        // Evict oldest entry once the ring reaches its time-window capacity.
+        let cap = self.frame_times.capacity();
         self.frame_times.push_back(delta_ms);
-        if self.frame_times.len() > 3600 {
+        if self.frame_times.len() > cap {
             self.frame_times.pop_front();
         }
 
         self.presentation_timestamps.push_back(presentation_ts);
-        if self.presentation_timestamps.len() > 3600 {
+        if self.presentation_timestamps.len() > cap {
             self.presentation_timestamps.pop_front();
         }
 
@@ -557,6 +564,8 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// # Fields emitted
 /// - `schema`       — version tag; increment when the field set changes
 /// - `frame`        — monotonic frame index since session start
+/// - `cube_count`   — cube count active during this frame (always present, lets
+///                    post-hoc analysis correlate pacing regressions with load steps)
 /// - `ts_ns`        — raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
 /// - `delta_ms`     — measured inter-frame interval on the presentation clock
 /// - `ideal_ms`     — target vblank period from monitor refresh rate
@@ -577,14 +586,15 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// Optional fields (`ipc_delta_ms`, `cpu_frame_ms`, `slack_ms`, `gpu_time_ms`) are
 /// omitted from the JSON object entirely when `None`, keeping the log compact and
 /// grep-friendly.
-pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord) {
+pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord, cube_count: u32) {
     let Some(f) = file else { return };
 
-    // schema:1 add gpu_time_ms field, bump if field set changes again.
+    // schema:2 adds cube_count field; bump again if field set changes.
     let _ = write!(
         f,
-        r#"{{"schema":1,"frame":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
+        r#"{{"schema":2,"frame":{},"cube_count":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
         record.frame_index,
+        cube_count,
         record.timestamp_ns,
         record.delta_ms,
         record.ideal_ms,

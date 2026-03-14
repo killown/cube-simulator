@@ -200,66 +200,134 @@ fn march_inner(ro: vec3<f32>, rd: vec3<f32>, cube_i: f32, t_scene: f32, time: f3
 }
 
 // ── OSD ───────────────────────────────────────────────────────────────────────
+//
+// Font: 3×5 pixel bitmap. Each glyph is a 15-bit mask stored as an i32.
+// Bit layout (row-major, bit 14 = top-left):
+//   col:  0  1  2
+//   row0: 14 13 12
+//   row1: 11 10  9
+//   row2:  8  7  6
+//   row3:  5  4  3
+//   row4:  2  1  0
+//
+// Number layout (left-aligned, x=0 is the most-significant digit):
+//   [d0][gap][d1][gap][d2][gap][d3][DOT_PAD][.][DOT_PAD][f0][gap][f1]
+//
+// This means numbers start immediately after the label separator with no
+// fixed-width padding, so "1" and "120" both begin at the same column.
+
+const CHAR_W: f32     = 3.0;  // glyph cell width
+const CHAR_H: f32     = 5.0;  // glyph cell height
+const CHAR_GAP: f32   = 2.0;  // gap between glyphs
+const ROW_STRIDE: f32 = 7.0;  // vertical row pitch
+// X where the number field starts (3 label chars + 1 separator gap).
+const NUM_X_OFF: f32  = (CHAR_W + CHAR_GAP) * 3.3 + CHAR_GAP;
+const OSD_SCALE: f32  = 4.0;  // screen pixels per logical OSD pixel
+// Symmetric padding around the decimal point.
+const DOT_PAD: f32    = 3.0;
 
 fn sd_char(uv: vec2<f32>, bits: i32) -> f32 {
-    if (uv.x < 0.0 || uv.x >= 3.0 || uv.y < 0.0 || uv.y >= 5.0) { return 0.0; }
+    if (uv.x < 0.0 || uv.x >= CHAR_W || uv.y < 0.0 || uv.y >= CHAR_H) { return 0.0; }
     let bit_idx = u32((4 - i32(uv.y)) * 3 + i32(uv.x));
     if ((bits & (1 << bit_idx)) != 0) {
-        let d = max(abs(fract(uv.x) - 0.5), abs(fract(uv.y) - 0.5)) - 0.4;
+        let d = length(fract(uv) - vec2(0.5)) - 0.4;
         if (d < 0.0) { return 1.0; }
     }
     return 0.0;
 }
 
-fn draw_num(uv: vec2<f32>, val: i32) -> f32 {
-    let digits = array<i32, 10>(31599, 9879, 31183, 31207, 23524, 29671, 29679, 30994, 31727, 31719);
-    var d = sd_char(uv - vec2(8.0, 0.0), digits[val % 10]);
-    if (val >= 10)  { d = max(d, sd_char(uv - vec2(4.0, 0.0), digits[(val / 10)  % 10])); }
-    if (val >= 100) { d = max(d, sd_char(uv,                  digits[(val / 100) % 10])); }
-    return d;
+/// Renders a float left-aligned at `origin`.
+///
+/// Digits are written left-to-right: most-significant integer digit at x=0,
+/// then the decimal point (with DOT_PAD clearance on both sides), then
+/// fractional digits. `decimals` is 0, 1, or 2.
+fn number(val: f32, decimals: i32, origin: vec2<f32>, frag: vec2<f32>) -> f32 {
+    let digits = array<i32, 10>(
+        31599, 9879, 31183, 31207, 23524, 29671, 29679, 30994, 31727, 31719
+    );
+    const MINUS: i32 = 128;
+    const DOT: i32   = 2;
+    const STEP: f32  = CHAR_W + CHAR_GAP;  // one digit column width
+
+    let b  = frag - origin;
+    let av = abs(val);
+    let ival = i32(av);
+    var out = 0.0;
+
+    // Count integer digits to know how many columns the integer part occupies.
+    var int_digits: i32;
+    if      (ival >= 1000) { int_digits = 4; }
+    else if (ival >= 100)  { int_digits = 3; }
+    else if (ival >= 10)   { int_digits = 2; }
+    else                   { int_digits = 1; }
+
+    // Render integer digits left-to-right starting at x=0.
+    if (int_digits >= 4) {
+        out = max(out, sd_char(b - vec2(STEP * 0.0, 0.0), digits[(ival / 1000) % 10]));
+    }
+    if (int_digits >= 3) {
+        let col = f32(int_digits - 3);
+        out = max(out, sd_char(b - vec2(STEP * col, 0.0), digits[(ival / 100) % 10]));
+    }
+    if (int_digits >= 2) {
+        let col = f32(int_digits - 2);
+        out = max(out, sd_char(b - vec2(STEP * col, 0.0), digits[(ival / 10) % 10]));
+    }
+    {
+        let col = f32(int_digits - 1);
+        out = max(out, sd_char(b - vec2(STEP * col, 0.0), digits[ival % 10]));
+    }
+
+    // Minus sign one column left of the first digit.
+    if (val < 0.0) {
+        out = max(out, sd_char(b + vec2(STEP, 0.0), MINUS));
+    }
+
+    if (decimals <= 0) { return out; }
+
+    // Decimal point: DOT_PAD after the last integer digit, DOT_PAD before frac.
+    let dot_x = STEP * f32(int_digits) - CHAR_GAP + DOT_PAD;
+    out = max(out, sd_char(b - vec2(dot_x, 0.0), DOT));
+
+    // Fractional digits start DOT_PAD after the dot centre.
+    let frac_x = dot_x + DOT_PAD;
+    if (decimals >= 1) {
+        out = max(out, sd_char(b - vec2(frac_x, 0.0),
+                               digits[i32(av * 10.0) % 10]));
+    }
+    if (decimals >= 2) {
+        out = max(out, sd_char(b - vec2(frac_x + STEP, 0.0),
+                               digits[i32(av * 100.0) % 10]));
+    }
+
+    return out;
 }
 
-fn osd_mask(b: vec2<f32>) -> f32 {
-    // Row 0: FPS  (F=29385, P=31689, S=29671)
-    var d = max(sd_char(b, 29385), max(sd_char(b - vec2(4.0, 0.0), 31689), sd_char(b - vec2(8.0, 0.0), 29671)));
-    d = max(d, draw_num(b - vec2(14.0, 0.0), i32(u.fps_data.x)));
-    // Row 1: MIN  (M=24429, I=29847, N=24557)
-    let r1 = b - vec2(0.0, 6.0);
-    d = max(d, max(sd_char(r1, 24429), max(sd_char(r1 - vec2(4.0, 0.0), 29847), sd_char(r1 - vec2(8.0, 0.0), 24557))));
-    d = max(d, draw_num(r1 - vec2(14.0, 0.0), i32(u.fps_data.y)));
-    // Row 2: MAX  (M=24429, A=11245, X=23213)
-    let r2 = b - vec2(0.0, 12.0);
-    d = max(d, max(sd_char(r2, 24429), max(sd_char(r2 - vec2(4.0, 0.0), 11245), sd_char(r2 - vec2(8.0, 0.0), 23213))));
-    d = max(d, draw_num(r2 - vec2(14.0, 0.0), i32(u.fps_data.z)));
-    // Row 3: LOW  (L=4687, O=31599, W=23418)
-    let r3 = b - vec2(0.0, 18.0);
-    d = max(d, max(sd_char(r3, 4687), max(sd_char(r3 - vec2(4.0, 0.0), 31599), sd_char(r3 - vec2(8.0, 0.0), 23418))));
-    d = max(d, draw_num(r3 - vec2(14.0, 0.0), i32(u.fps_data.w)));
-    // Row 4: JIT  (J=26926, I=29847, T=29842)
-    let r4 = b - vec2(0.0, 24.0);
-    d = max(d, max(sd_char(r4, 26926), max(sd_char(r4 - vec2(4.0, 0.0), 29847), sd_char(r4 - vec2(8.0, 0.0), 29842))));
-    d = max(d, draw_num(r4 - vec2(14.0, 0.0), i32(u.adv_data.x)));
-    // Row 5: MSD  (M=24429, S=29671, D=15211)
-    let r5 = b - vec2(0.0, 30.0);
-    d = max(d, max(sd_char(r5, 24429), max(sd_char(r5 - vec2(4.0, 0.0), 29671), sd_char(r5 - vec2(8.0, 0.0), 15211))));
-    d = max(d, draw_num(r5 - vec2(14.0, 0.0), i32(u.adv_data.y)));
-    // Row 6: FTV  (F=29385, T=29842, V=23378)
-    let r6 = b - vec2(0.0, 36.0);
-    d = max(d, max(sd_char(r6, 29385), max(sd_char(r6 - vec2(4.0, 0.0), 29842), sd_char(r6 - vec2(8.0, 0.0), 23378))));
-    d = max(d, draw_num(r6 - vec2(14.0, 0.0), i32(u.adv_data.z)));
-    // Row 7: CPU  (C=29263, P=31689, U=23407)
-    let r7 = b - vec2(0.0, 42.0);
-    d = max(d, max(sd_char(r7, 29263), max(sd_char(r7 - vec2(4.0, 0.0), 31689), sd_char(r7 - vec2(8.0, 0.0), 23407))));
-    d = max(d, draw_num(r7 - vec2(14.0, 0.0), i32(u.cpu_time_ms)));
-    // Row 8: GPU  (G=29551, P=31689, U=23407)
-    let r8 = b - vec2(0.0, 48.0);
-    d = max(d, max(sd_char(r8, 29551), max(sd_char(r8 - vec2(4.0, 0.0), 31689), sd_char(r8 - vec2(8.0, 0.0), 23407))));
-    d = max(d, draw_num(r8 - vec2(14.0, 0.0), i32(u.gpu_time_ms)));
-    // Row 9: SYN  (S=29671, Y=23506, N=24557)
-    let r9 = b - vec2(0.0, 54.0);
-    d = max(d, max(sd_char(r9, 29671), max(sd_char(r9 - vec2(4.0, 0.0), 23506), sd_char(r9 - vec2(8.0, 0.0), 24557))));
-    d = max(d, draw_num(r9 - vec2(14.0, 0.0), i32(u.sync_score)));
+/// Renders one OSD row: a 3-char label then a float value, all at row `row`.
+fn osd_row(row: f32, c0: i32, c1: i32, c2: i32, val: f32, dec: i32, frag: vec2<f32>) -> f32 {
+    const STEP: f32 = CHAR_W + CHAR_GAP;
+    let oy  = row * ROW_STRIDE;
+    let b   = frag - vec2(0.0, oy);
+    var out = 0.0;
+    out = max(out, sd_char(b,                    c0));
+    out = max(out, sd_char(b - vec2(STEP, 0.0),  c1));
+    out = max(out, sd_char(b - vec2(STEP*2.0, 0.0), c2));
+    out = max(out, number(val, dec, vec2(NUM_X_OFF, oy), frag));
+    return out;
+}
 
+fn osd_mask(frag: vec2<f32>) -> f32 {
+    var d = 0.0;
+    d = max(d, osd_row(0.0, 29385, 31689, 29671, u.fps_data.x,  0, frag)); // FPS
+    d = max(d, osd_row(1.0, 24429, 29847, 24557, u.fps_data.y,  0, frag)); // MIN
+    d = max(d, osd_row(2.0, 24429, 11245, 23213, u.fps_data.z,  0, frag)); // MAX
+    d = max(d, osd_row(3.0,  4687, 31599, 23418, u.fps_data.w,  0, frag)); // LOW
+    d = max(d, osd_row(4.0, 26926, 29847, 29842, u.adv_data.x,  2, frag)); // JIT
+    d = max(d, osd_row(5.0, 24429, 29671, 15211, u.adv_data.y,  0, frag)); // MSD
+    d = max(d, osd_row(6.0, 29385, 29842, 23378, u.adv_data.z,  1, frag)); // FTV
+    d = max(d, osd_row(7.0, 29263, 31689, 23407, u.cpu_time_ms, 2, frag)); // CPU
+    d = max(d, osd_row(8.0, 29551, 31689, 23407, u.gpu_time_ms, 2, frag)); // GPU
+    d = max(d, osd_row(9.0, 29671, 23506, 24557, u.sync_score,  1, frag)); // SYN
     return step(0.5, d);
 }
 
@@ -379,7 +447,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let osd = osd_mask(vec2((in.uv.x + 0.98) * 110.0, (0.98 - in.uv.y) * 110.0));
+    let osd = osd_mask((in.clip_position.xy - vec2(8.0, 8.0)) / OSD_SCALE);
     let osd_col = mix(color, vec3(0.0, 1.0, 0.5), osd);
     // Additive composite: red drop flash + yellow sustained-pressure flash.
     // Both clamped to [0,1] so they never blow out HDR surfaces.
