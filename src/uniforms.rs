@@ -1,3 +1,4 @@
+// uniforms.rs
 use wgpu::util::DeviceExt;
 
 use crate::args::Args;
@@ -7,7 +8,7 @@ use crate::args::Args;
 /// Must remain `#[repr(C)]` and implement `Pod`/`Zeroable` so it can be
 /// cast directly to bytes via `bytemuck` without any intermediate copy.
 ///
-/// Layout (80 bytes, 16-byte aligned):
+/// Layout (112 bytes, 16-byte aligned):
 /// ```text
 /// offset  0: color         [f32; 4]
 /// offset 16: cube_count    u32
@@ -19,7 +20,10 @@ use crate::args::Args;
 /// offset 64: time          f32
 /// offset 68: stutter_decay f32   — 1.0 on dropped frame, decays ~30 frames
 /// offset 72: pacing_decay  f32   — EMA(vblank_mul) pressure, decays ~45 frames
-/// offset 76: _pad          f32
+/// offset 76: gpu_time_ms   f32
+/// offset 80: sync_score    f32
+/// offset 84: cpu_time_ms   f32
+/// offset 88: _pad          [f32; 6]
 /// ```
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -44,7 +48,10 @@ pub struct ShaderUniforms {
     /// orthogonal to `stutter_decay`: it measures a bad *regime*, not a
     /// single bad frame.
     pub pacing_decay: f32,
-    pub _pad: f32,
+    pub gpu_time_ms: f32,
+    pub sync_score: f32,
+    pub cpu_time_ms: f32,
+    pub _pad: [f32; 6],
 }
 
 impl ShaderUniforms {
@@ -61,11 +68,15 @@ impl ShaderUniforms {
             time: 0.0,
             stutter_decay: 0.0,
             pacing_decay: 0.0,
-            _pad: 0.0,
+            gpu_time_ms: 0.0,
+            sync_score: 0.0,
+            cpu_time_ms: 0.0,
+            _pad: [0.0; 6],
         }
     }
 
     /// Constructs a uniform with live per-frame metric data.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_metrics(
         args: &Args,
         cube_count: u32,
@@ -79,6 +90,9 @@ impl ShaderUniforms {
         time: f32,
         stutter_decay: f32,
         pacing_decay: f32,
+        gpu_time_ms: f32,
+        sync_score: f32,
+        cpu_time_ms: f32,
     ) -> Self {
         Self {
             color: [args.red, args.green, args.blue, 1.0],
@@ -91,7 +105,10 @@ impl ShaderUniforms {
             time,
             stutter_decay,
             pacing_decay,
-            _pad: 0.0,
+            gpu_time_ms,
+            sync_score,
+            cpu_time_ms,
+            _pad: [0.0; 6],
         }
     }
 }

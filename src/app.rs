@@ -41,21 +41,23 @@ impl<'a> ApplicationHandler for App<'a> {
             MAX:  Maximum FPS observed\n\
             LOW:  1% Low FPS (stutter indicator)\n\
             JIT:  Frame-to-frame variance (ms)\n\
-            MSD:  Missed frames (>{:.1}ms threshold)\n\
-            FTV:  Frame Time Variance %%, stddev/mean of frame times in the rolling window.\n\
-                  0%% = perfectly uniform delivery. High %% = frames bunching (some near-instant,\n\
-                  some very slow), which looks skippy even when mean FPS appears acceptable.\n",
-            self.args.threshold
+            MSD:  Maximum single-frame delay (ms)\n\
+            FTV:  Frame time variance\n\
+            CPU:  CPU execution time (ms)\n\
+            GPU:  GPU execution time (ms)\n\
+            SYN:  Vblank alignment sync score (0-100)\n\
+            =============="
         );
     }
 
     fn window_event(
         &mut self,
         el: &ActiveEventLoop,
-        _id: winit::window::WindowId,
+        window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        if let Some(state) = self.state.as_mut() {
+        let Some(state) = &mut self.state else { return };
+        if window_id == state.window.id() {
             match event {
                 WindowEvent::CloseRequested => el.exit(),
                 WindowEvent::KeyboardInput {

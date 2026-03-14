@@ -194,6 +194,15 @@ target/release/frame-test
 
   A value near **0%** means all frames took approximately the same time perfectly uniform delivery. A high value means frame times are spread widely: some frames complete in a few milliseconds while others take tens of milliseconds. Even if the mean FPS looks acceptable, this imbalance causes frames to bunch together and then stall, which the eye perceives as judder or skipping.
 
+- **CPU (CPU Time)**
+  The total time in milliseconds spent on the host processor to prepare and submit a frame. This includes input processing, world state updates, and encoding the `wgpu` command buffer. High CPU time relative to the frame budget suggests the application is "CPU bound," which can lead to input lag and frame drops even if the GPU is idle.
+
+- **GPU (GPU Time)**
+  The actual hardware execution time on the graphics card, measured via `TIMESTAMP_QUERY`. This represents the duration from when the GPU starts processing the first draw call to when the final render pass completes. By comparing this against the frame budget, you can determine if the shader complexity or cube count is exceeding the hardware's fill rate or compute throughput.
+
+- **SYN (Sync Score)**
+  A phase-locked alignment metric (0–100) representing how consistently the application's presentation hits the monitor's VSync intervals. A score of **100** indicates perfect phase-alignment with the display's hardware clock. A dropping score indicates "VBlank drift," where the application is losing its synchronization with the compositor, often a precursor to dropped frames or fluctuating latency.
+
 > **Example:** A sequence of `[5ms, 48ms, 6ms, 47ms]` averages to roughly 19 FPS, but the near-zero gaps between paired frames make the presentation look as if frames are being skipped entirely, because two frames arrive nearly simultaneously followed by a long gap. FTV will read high in this scenario while JIT and FPS alone may not tell the full story.
 
 ### Performance Note: Why Raymarching?

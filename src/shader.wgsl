@@ -13,7 +13,9 @@ struct Uniforms {
     time:          f32,
     stutter_decay: f32,         // 1.0 on dropped frame,         decays ~30 frames
     pacing_decay:  f32,         // EMA vblank_mul pressure,      decays ~45 frames
-    _pad:          f32,
+    gpu_time_ms:   f32,
+    sync_score:    f32,
+    cpu_time_ms:   f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -208,6 +210,7 @@ fn sd_char(uv: vec2<f32>, bits: i32) -> f32 {
     }
     return 0.0;
 }
+
 fn draw_num(uv: vec2<f32>, val: i32) -> f32 {
     let digits = array<i32, 10>(31599, 9879, 31183, 31207, 23524, 29671, 29679, 30994, 31727, 31719);
     var d = sd_char(uv - vec2(8.0, 0.0), digits[val % 10]);
@@ -215,6 +218,7 @@ fn draw_num(uv: vec2<f32>, val: i32) -> f32 {
     if (val >= 100) { d = max(d, sd_char(uv,                  digits[(val / 100) % 10])); }
     return d;
 }
+
 fn osd_mask(b: vec2<f32>) -> f32 {
     // Row 0: FPS  (F=29385, P=31689, S=29671)
     var d = max(sd_char(b, 29385), max(sd_char(b - vec2(4.0, 0.0), 31689), sd_char(b - vec2(8.0, 0.0), 29671)));
@@ -243,6 +247,19 @@ fn osd_mask(b: vec2<f32>) -> f32 {
     let r6 = b - vec2(0.0, 36.0);
     d = max(d, max(sd_char(r6, 29385), max(sd_char(r6 - vec2(4.0, 0.0), 29842), sd_char(r6 - vec2(8.0, 0.0), 23378))));
     d = max(d, draw_num(r6 - vec2(14.0, 0.0), i32(u.adv_data.z)));
+    // Row 7: CPU  (C=29263, P=31689, U=23407)
+    let r7 = b - vec2(0.0, 42.0);
+    d = max(d, max(sd_char(r7, 29263), max(sd_char(r7 - vec2(4.0, 0.0), 31689), sd_char(r7 - vec2(8.0, 0.0), 23407))));
+    d = max(d, draw_num(r7 - vec2(14.0, 0.0), i32(u.cpu_time_ms)));
+    // Row 8: GPU  (G=29551, P=31689, U=23407)
+    let r8 = b - vec2(0.0, 48.0);
+    d = max(d, max(sd_char(r8, 29551), max(sd_char(r8 - vec2(4.0, 0.0), 31689), sd_char(r8 - vec2(8.0, 0.0), 23407))));
+    d = max(d, draw_num(r8 - vec2(14.0, 0.0), i32(u.gpu_time_ms)));
+    // Row 9: SYN  (S=29671, Y=23506, N=24557)
+    let r9 = b - vec2(0.0, 54.0);
+    d = max(d, max(sd_char(r9, 29671), max(sd_char(r9 - vec2(4.0, 0.0), 23506), sd_char(r9 - vec2(8.0, 0.0), 24557))));
+    d = max(d, draw_num(r9 - vec2(14.0, 0.0), i32(u.sync_score)));
+
     return step(0.5, d);
 }
 

@@ -457,6 +457,8 @@ impl<'a> State<'a> {
         output.present();
         let cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
 
+        let mut pacing_record = None;
+
         // Sample the WSI clock after present(). On DRM/KMS+Vulkan backends this
         // is CLOCK_MONOTONIC nanoseconds from the presentation engine, the same
         // domain as vblank timestamps. Computing deltas between consecutive samples
@@ -494,11 +496,12 @@ impl<'a> State<'a> {
                 // Feed the raw timestamp into the pacing analyzer before the
                 // 500ms tick gate so every individual frame's phase drift and
                 // sync score are captured and logged at full frame resolution.
-                if let Some(record) =
+                pacing_record =
                     self.pacing
-                        .push(now_ns, Some(cpu_frame_ms), cpu_submit_ns, gpu_time_ms)
-                {
-                    write_frame_log_row(&mut self.frame_log_file, &record);
+                        .push(now_ns, Some(cpu_frame_ms), cpu_submit_ns, gpu_time_ms);
+
+                if let Some(record) = &pacing_record {
+                    write_frame_log_row(&mut self.frame_log_file, record);
 
                     // Any single missed vblank is a yellow warning, a momentary ping.
                     if record.vblank_mul > 1 {
@@ -549,11 +552,17 @@ impl<'a> State<'a> {
                 self.start_time.elapsed().as_secs_f32(),
                 self.stutter_decay,
                 self.pacing_decay,
+                self.gpu_timer.last_gpu_time_ms().unwrap_or(0.0),
+                pacing_record
+                    .as_ref()
+                    .map(|r| r.sync_score)
+                    .unwrap_or(self.current_uniforms.sync_score),
+                cpu_frame_ms,
             );
+
             self.uniform_binding
                 .write(&self.queue, &self.current_uniforms);
         }
-
         // ── Benchmark tick ────────────────────────────────────────────────────
         // Runs after the uniforms are updated so the last frame of a step still
         // renders the correct cube count before the machine advances.
