@@ -40,11 +40,11 @@ impl<'a> ApplicationHandler for App<'a> {
             MIN:  Minimum FPS observed\n\
             MAX:  Maximum FPS observed\n\
             LOW:  1% Low FPS (stutter indicator)\n\
-            JIT:  Frame-to-frame variance (ms)\n\
-            MSD:  Maximum single-frame delay (ms)\n\
-            FTV:  Frame time variance\n\
-            CPU:  CPU execution time (ms)\n\
-            GPU:  GPU execution time (ms)\n\
+            JIT:  Frame-to-frame jitter (ms)\n\
+            MSD:  Missed/dropped frame count\n\
+            FTV:  Frame time variance (%)\n\
+            CPU:  CPU frame time (ms)\n\
+            GPU:  GPU render time (ms)\n\
             SYN:  Vblank alignment sync score (0-100)\n\
             =============="
         );
