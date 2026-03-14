@@ -78,7 +78,13 @@ pub struct FramePacingRecord {
     ///
     /// `1` = on time.  `2` = one vblank dropped (GPU overran or compositor missed
     /// deadline).  `≥ 3` = severe stall (TTM eviction, GPU preemption, thermal
-    /// throttle).  Derived as `max(1, round(delta_ms / ideal_ms))`.
+    /// throttle).
+    ///
+    /// Uses a 1.25× hysteresis band instead of a bare `round()`: a frame must
+    /// consume at least 125% of `ideal_ms` before being promoted to `vblank_mul = 2`.
+    /// This eliminates false positives at 120–165 Hz where `CLOCK_MONOTONIC` jitter
+    /// on tickless kernels is large enough to push a clean frame over the 0.5×
+    /// midpoint that `round()` would trip on.
     pub vblank_mul: u32,
 
     /// Normalised frame sync quality: 100 = perfectly on-vblank, 0 = half-period drift.
@@ -123,6 +129,23 @@ pub struct FramePacingRecord {
     ///
     /// `None` when `cpu_submit_ns` was not supplied to [`PacingAnalyzer::push`].
     pub slack_ms: Option<f32>,
+
+    /// True GPU execution time measured by hardware timestamp queries (milliseconds).
+    ///
+    /// Obtained from a `wgpu::QuerySet` with `TIMESTAMP_QUERY` capability, written
+    /// by the render pass begin/end timestamps and resolved via `resolve_query_set`.
+    /// This is the only signal that unambiguously answers "did the GPU overrun its
+    /// budget?" — `slack_ms` cannot distinguish GPU overrun from compositor hold.
+    ///
+    /// Cross-reference:
+    /// - `gpu_time_ms > ideal_ms`         → GPU render budget exceeded; reduce load.
+    /// - `gpu_time_ms < ideal_ms` + high drift → compositor scheduling bottleneck.
+    /// - `gpu_time_ms ≈ 0`                → query not supported or not yet resolved.
+    ///
+    /// `None` when `TIMESTAMP_QUERY` is not available on the adapter or the readback
+    /// buffer has not yet been mapped (the value from the previous frame is used
+    /// until the mapping completes).
+    pub gpu_time_ms: Option<f32>,
 }
 
 /// Stateful per-frame pacing analyzer driven by hardware presentation timestamps.
@@ -171,6 +194,10 @@ impl PacingAnalyzer {
     /// `delta_ms` is outside the plausible range `(0, 1000 ms)`, which indicates a
     /// clock discontinuity (suspend/resume, VT switch, DPMS wakeup).
     ///
+    /// The phase origin is recalibrated whenever `delta_ms > 3 × ideal_ms` so that
+    /// a DPMS wakeup or VT switch does not leave the grid anchored to a stale origin
+    /// and produce phantom drift on every subsequent frame.
+    ///
     /// # Arguments
     /// * `ts_ns` Raw KMS/WSI nanosecond timestamp from
     ///   `adapter.get_presentation_timestamp()`.  Must be CLOCK_MONOTONIC domain.
@@ -181,11 +208,15 @@ impl PacingAnalyzer {
     ///   matched against the **next** frame's `ts_ns` to derive `slack_ms`, because
     ///   the hardware presentation timestamp for a given submit arrives one frame later.
     ///   `None` if not measured.
+    /// * `gpu_time_ms` True GPU execution time from a resolved `TIMESTAMP_QUERY`
+    ///   `QuerySet`, in milliseconds.  `None` when the feature is unavailable or the
+    ///   readback buffer has not yet been mapped.
     pub fn push(
         &mut self,
         ts_ns: u64,
         cpu_frame_ms: Option<f32>,
         cpu_submit_ns: Option<u64>,
+        gpu_time_ms: Option<f32>,
     ) -> Option<FramePacingRecord> {
         let idx = self.frame_index;
         self.frame_index += 1;
@@ -202,6 +233,16 @@ impl PacingAnalyzer {
             return None;
         }
 
+        let ideal_ms = self.ideal_period_ns as f32 / 1_000_000.0;
+
+        // Recalibrate the phase grid on large gaps (DPMS wakeup, VT switch, TTM
+        // eviction stall). Without this, every frame after the discontinuity shows
+        // phantom drift because `nearest_vblank_count` jumps by hundreds of periods
+        // yet the origin stays pinned to the pre-gap timestamp.
+        if delta_ms > ideal_ms * 3.0 {
+            self.phase_origin_ns = None;
+        }
+
         let origin = *self.phase_origin_ns.get_or_insert(ts_ns);
 
         // Distance of this timestamp from the phase origin in vblank periods.
@@ -213,14 +254,21 @@ impl PacingAnalyzer {
         let drift_ns = ts_ns as i64 - ideal_ts_ns as i64;
         let drift_ms = drift_ns as f32 / 1_000_000.0;
 
-        let half_period_ms = self.ideal_period_ns as f32 / 2_000_000.0;
+        let half_period_ms = ideal_ms / 2.0;
         let sync_score = (100.0 * (1.0 - drift_ms.abs() / half_period_ms)).clamp(0.0, 100.0);
 
-        // `round()` gives the true number of vblank periods consumed: 1 = on-time,
-        // 2 = one dropped, etc. `max(1)` guards against sub-frame deltas on
-        // Immediate mode where `delta_ms < ideal_ms` is valid.
-        let vblank_mul =
-            ((delta_ms / (self.ideal_period_ns as f32 / 1_000_000.0)).round() as u32).max(1);
+        // Hysteresis band: require delta_ms > 1.25 × ideal_ms before promoting to
+        // vblank_mul = 2. A bare round() trips at 0.5 × ideal_ms, which is only
+        // ~4 ms at 120 Hz — within CLOCK_MONOTONIC jitter on tickless kernels under
+        // load, producing false-positive yellow signals on clean high-refresh panels.
+        let vblank_mul = {
+            let ratio = delta_ms / ideal_ms;
+            if ratio < 1.25 {
+                1u32
+            } else {
+                (ratio.round() as u32).max(1)
+            }
+        };
 
         let ipc_delta_ms = self.prev_delta_ms.map(|prev_d| delta_ms - prev_d);
 
@@ -233,7 +281,7 @@ impl PacingAnalyzer {
             let gap_ms = gap_ns as f32 / 1_000_000.0;
             // Discard values outside [0, 5 × ideal]: negative = clock skew,
             // extreme positive = submit timestamp predates WSI origin or stale value.
-            let ceiling = (self.ideal_period_ns as f32 / 1_000_000.0) * 5.0;
+            let ceiling = ideal_ms * 5.0;
             (gap_ms > 0.0 && gap_ms < ceiling).then_some(gap_ms)
         });
 
@@ -244,7 +292,7 @@ impl PacingAnalyzer {
             frame_index: idx,
             timestamp_ns: ts_ns,
             delta_ms,
-            ideal_ms: self.ideal_period_ns as f32 / 1_000_000.0,
+            ideal_ms,
             phase_drift_ms: drift_ms,
             phase_drift_ns: drift_ns,
             vblank_mul,
@@ -252,6 +300,7 @@ impl PacingAnalyzer {
             ipc_delta_ms,
             cpu_frame_ms,
             slack_ms,
+            gpu_time_ms,
         })
     }
 }
@@ -506,6 +555,7 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// into how each individual frame landed relative to the ideal vblank grid.
 ///
 /// # Fields emitted
+/// - `schema`       — version tag; increment when the field set changes
 /// - `frame`        — monotonic frame index since session start
 /// - `ts_ns`        — raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
 /// - `delta_ms`     — measured inter-frame interval on the presentation clock
@@ -521,16 +571,19 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// - `slack_ms`     — `present_ts − submit_cpu`: GPU execution + flip pipeline depth;
 ///                    `drift high + slack high` = compositor policy bottleneck;
 ///                    `drift high + slack ≈ 0` = GPU budget overrun
+/// - `gpu_time_ms`  — true GPU execution time from hardware timestamp queries;
+///                    unambiguously separates GPU overrun from compositor hold
 ///
-/// Optional fields (`ipc_delta_ms`, `cpu_frame_ms`, `slack_ms`) are omitted from
-/// the JSON object entirely when `None`, keeping the log compact and grep-friendly.
+/// Optional fields (`ipc_delta_ms`, `cpu_frame_ms`, `slack_ms`, `gpu_time_ms`) are
+/// omitted from the JSON object entirely when `None`, keeping the log compact and
+/// grep-friendly.
 pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord) {
     let Some(f) = file else { return };
 
-    // Mandatory fields, always present.
+    // schema:1 add gpu_time_ms field, bump if field set changes again.
     let _ = write!(
         f,
-        r#"{{"frame":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
+        r#"{{"schema":1,"frame":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
         record.frame_index,
         record.timestamp_ns,
         record.delta_ms,
@@ -550,6 +603,9 @@ pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord) 
     }
     if let Some(v) = record.slack_ms {
         let _ = write!(f, r#","slack_ms":{:.4}"#, v);
+    }
+    if let Some(v) = record.gpu_time_ms {
+        let _ = write!(f, r#","gpu_time_ms":{:.4}"#, v);
     }
 
     let _ = writeln!(f, "}}");

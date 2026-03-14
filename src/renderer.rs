@@ -6,6 +6,7 @@ use winit::window::Window;
 
 use crate::args::Args;
 use crate::benchmark::BenchmarkState;
+use crate::gpu_timer::GpuTimer;
 use crate::metrics::{
     FrameMetrics, PacingAnalyzer, write_csv_row, write_frame_log_row, write_json_row,
 };
@@ -64,6 +65,9 @@ pub struct State<'a> {
     /// Whether the most-recently-processed pacing record had `vblank_mul > 1`.
     /// Reset each frame; fed into the benchmark tick.
     any_vblank_miss_this_frame: bool,
+    /// Hardware GPU execution timer. Wraps a `TIMESTAMP_QUERY` `QuerySet`; is a
+    /// zero-cost no-op when the adapter does not support the feature.
+    gpu_timer: GpuTimer,
 }
 
 impl<'a> State<'a> {
@@ -115,7 +119,12 @@ impl<'a> State<'a> {
             .unwrap();
 
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                // Request TIMESTAMP_QUERY when available; GpuTimer degrades to a
+                // no-op if the feature is absent, so this never fails the device request.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+                ..Default::default()
+            })
             .await
             .unwrap();
 
@@ -155,6 +164,16 @@ impl<'a> State<'a> {
             }
         };
 
+        let gpu_timer = GpuTimer::new(&device, &queue);
+        if gpu_timer.is_available() {
+            println!("GPU timestamps:          available (TIMESTAMP_QUERY, hardware-accurate)");
+        } else {
+            eprintln!(
+                "WARN: TIMESTAMP_QUERY not supported; gpu_time_ms absent from frame logs. \
+                 Cannot distinguish GPU budget overrun from compositor buffer-hold."
+            );
+        }
+
         let cmd_line = std::env::args().collect::<Vec<_>>().join(" ");
         let mut raw_header = format!("Command: {}\n", cmd_line);
 
@@ -175,6 +194,14 @@ impl<'a> State<'a> {
         }
         raw_header.push_str(&format!("Surface Format: {:?}\n", surface_format));
         raw_header.push_str(&format!("Present Mode: {:?}\n", present_mode));
+        raw_header.push_str(&format!(
+            "GPU Timestamps: {}\n",
+            if gpu_timer.is_available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ));
 
         let write_info = |base_path: &str, content: &str| {
             let path = std::path::Path::new(base_path);
@@ -222,7 +249,7 @@ impl<'a> State<'a> {
                 .append(true)
                 .open(path)
                 .unwrap();
-            let _ = writeln!(f, "# frame,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms]");
+            let _ = writeln!(f, "# schema:1 frame,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms][,gpu_time_ms]");
             Some(f)
         });
 
@@ -320,6 +347,7 @@ impl<'a> State<'a> {
             benchmark,
             benchmark_done: false,
             any_vblank_miss_this_frame: false,
+            gpu_timer,
         }
     }
 
@@ -356,6 +384,11 @@ impl<'a> State<'a> {
         self.pacing_decay = (self.pacing_decay - PACING_DECAY_RATE).max(0.0);
         self.any_vblank_miss_this_frame = false;
 
+        // Drain the async readback from the previous frame. Must happen before
+        // resolve() overwrites the readback buffer with frame N-1's queries.
+        self.gpu_timer.poll();
+        let gpu_time_ms = self.gpu_timer.last_gpu_time_ms();
+
         // Write time in one upload before acquire.
         self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
         self.current_uniforms.stutter_decay = self.stutter_decay;
@@ -373,6 +406,11 @@ impl<'a> State<'a> {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
+        // Resolve frame N-1's timestamp queries before the render pass overwrites
+        // the query set with frame N's timestamps. Both ops are in the same submit
+        // so the GPU sees them in order: [resolve N-1] → [render pass N].
+        self.gpu_timer.resolve(&mut encoder);
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -385,6 +423,7 @@ impl<'a> State<'a> {
                     },
                     depth_slice: None,
                 })],
+                timestamp_writes: self.gpu_timer.timestamp_writes(),
                 ..Default::default()
             });
             rpass.set_pipeline(&self.render_pipeline);
@@ -393,6 +432,9 @@ impl<'a> State<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        // Arm the async map for the resolve just submitted. The result becomes
+        // available the next time gpu_timer.poll() runs (top of next frame).
+        self.gpu_timer.arm_readback();
         // Capture CPU-domain submit timestamp immediately after the driver has
         // accepted the command buffer. On Linux, std::time::Instant uses
         // CLOCK_MONOTONIC, the same epoch as WSI presentation timestamps, so the
@@ -452,7 +494,10 @@ impl<'a> State<'a> {
                 // Feed the raw timestamp into the pacing analyzer before the
                 // 500ms tick gate so every individual frame's phase drift and
                 // sync score are captured and logged at full frame resolution.
-                if let Some(record) = self.pacing.push(now_ns, Some(cpu_frame_ms), cpu_submit_ns) {
+                if let Some(record) =
+                    self.pacing
+                        .push(now_ns, Some(cpu_frame_ms), cpu_submit_ns, gpu_time_ms)
+                {
                     write_frame_log_row(&mut self.frame_log_file, &record);
 
                     // Any single missed vblank is a yellow warning, a momentary ping.
