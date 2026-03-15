@@ -76,7 +76,7 @@ pub struct State<'a> {
 /// that `submit_ns, present_ts` produces an accurate `slack_ms` without any
 /// anchor arithmetic.
 ///
-/// Falls back to `0` only on platforms where the syscall is unavailable; the
+/// Falls back to `0` only on platforms where the syscall is unavailable, the
 /// caller treats `0` as `None` in the pacing filter (`gap_ms > 0.0`).
 #[cfg(target_os = "linux")]
 #[inline]
@@ -147,9 +147,12 @@ impl<'a> State<'a> {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                // Request TIMESTAMP_QUERY when available; GpuTimer degrades to a
-                // no-op if the feature is absent, so this never fails the device request.
-                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+                // Request all three timestamp features when available; GpuTimer
+                // degrades independently for each so missing any never fails the request.
+                required_features: adapter.features()
+                    & (wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
                 ..Default::default()
             })
             .await
@@ -202,6 +205,11 @@ impl<'a> State<'a> {
             eprintln!(
                 "WARN: TIMESTAMP_QUERY not supported; gpu_time_ms absent from frame logs. \
                  Cannot distinguish GPU budget overrun from compositor buffer-hold."
+            );
+        }
+        if gpu_timer.is_micro_available() {
+            println!(
+                "GPU micro-timings:       available (driver/shader/resolve breakdown on vblank miss)"
             );
         }
 
@@ -426,6 +434,7 @@ impl<'a> State<'a> {
         // resolve() overwrites the readback buffer with frame N-1's queries.
         self.gpu_timer.poll();
         let gpu_time_ms = self.gpu_timer.last_gpu_time_ms();
+        let micro = self.gpu_timer.last_micro_timings();
 
         // Write time in one upload before acquire.
         self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
@@ -449,6 +458,10 @@ impl<'a> State<'a> {
         // so the GPU sees them in order: [resolve N-1] → [render pass N].
         self.gpu_timer.resolve(&mut encoder);
 
+        // MICRO_SLOT_SUBMIT_PRE: marks the start of GPU command processing.
+        // Gap to PASS_BEGIN isolates driver submission latency from shader time.
+        self.gpu_timer.write_pre_pass(&mut encoder);
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -468,6 +481,10 @@ impl<'a> State<'a> {
             rpass.set_bind_group(0, &self.uniform_binding.bind_group, &[]);
             rpass.draw(0..4, 0..1);
         }
+
+        // MICRO_SLOT_RESOLVE_END: written after the render pass and the micro
+        // query-set resolve. Gap to PASS_END = GPU DMA + PCIe copy overhead.
+        self.gpu_timer.write_post_resolve(&mut encoder);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         // Arm the async map for the resolve just submitted. The result becomes
@@ -535,6 +552,31 @@ impl<'a> State<'a> {
                     if record.vblank_mul > 1 {
                         self.pacing_decay = 1.0;
                         self.any_vblank_miss_this_frame = true;
+
+                        // When micro-timings are available, print a one-line root-cause
+                        // diagnosis so the user knows whether the miss was caused by the
+                        // GPU shader, the driver stalling the command buffer, or DMA/PCIe
+                        // resolve overhead, three failure modes that look identical from
+                        // vblank_mul alone.
+                        if let Some(m) = micro {
+                            let cause = if m.driver_overhead_ms > 0.5 {
+                                "DRIVER STALL"
+                            } else if m.resolve_ms > 0.3 {
+                                "RESOLVE/DMA SPIKE"
+                            } else {
+                                "SHADER OVERRUN"
+                            };
+                            eprintln!(
+                                "[MICRO] vblank×{} — {} \
+                                 (driver {:.2}ms  shader {:.2}ms  resolve {:.2}ms  total {:.2}ms)",
+                                record.vblank_mul,
+                                cause,
+                                m.driver_overhead_ms,
+                                m.shader_ms,
+                                m.resolve_ms,
+                                m.total_ms,
+                            );
+                        }
                     }
 
                     // EMA breach is the severe regime, fire red and let it linger.
