@@ -148,14 +148,21 @@ impl<'a> State<'a> {
             .await
             .unwrap();
 
+        let timestamp_features = match adapter.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => {
+                adapter.features()
+                    & (wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+            }
+            _ => wgpu::Features::empty(),
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 // TIMESTAMP_QUERY: outer render-pass timer (shader time).
                 // TIMESTAMP_QUERY_INSIDE_ENCODERS: encoder brackets for driver
                 // overhead and DMA resolve time. Both degrade silently if absent.
-                required_features: adapter.features()
-                    & (wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+                required_features: timestamp_features,
                 ..Default::default()
             })
             .await
