@@ -1,13 +1,10 @@
 // shader_low.wgsl
 // Low-end rasterised variant.  Identical Uniforms layout and OSD/marker
 // subsystems as shader.wgsl.  The per-pixel SDF raymarching loop is replaced
-// by an analytic ray-vs-OBB intersection: the ray is transformed into each
-// cube's local frame and tested against an axis-aligned box there, which is
-// a closed-form O(1) operation per cube with no iterative march.
-//
-// Visual output: geometrically correct rotating coloured cubes with flat
-// face shading, a depth-sorted front-face normal tint, and the full OSD +
-// stutter/pacing marker overlay.
+// by an analytic ray-vs-hollow-OBB intersection: each cube is a box with a
+// sphere carved out of its interior (max(-sphere, cube)), matching the exact
+// hollow silhouette of the high-end shader, computed in closed form with no
+// iterative march.
 
 struct Uniforms {
     color:         vec4<f32>,
@@ -43,7 +40,7 @@ fn vs_main(@builtin(vertex_index) v_idx: u32) -> VertexOutput {
     return out;
 }
 
-// ── Shared helpers (identical signatures to shader.wgsl) ────────────────────
+// ── Shared helpers (identical to shader.wgsl) ────────────────────────────────
 
 fn rot(a: f32) -> mat2x2<f32> {
     let s = sin(a); let c = cos(a);
@@ -93,60 +90,136 @@ fn cube_local(p: vec3<f32>, fi: f32, t: f32) -> vec3<f32> {
     return q;
 }
 
-// ── Analytic ray-vs-OBB intersection ─────────────────────────────────────────
+// ── Analytic ray-vs-hollow-OBB ────────────────────────────────────────────────
 //
-// Strategy: transform both ray origin and direction into cube-local space
-// (where the cube is an AABB [-size, +size]^3), then apply the standard
-// slab test.  Returns the entry t along the ray, or -1.0 on miss.
+// The high-end SDF computes:  d = max(-sphere, cube)
+// which is a cube with a sphere subtracted from its interior.  Analytically
+// this produces two visible surface regions on a single ray:
 //
-// This replaces the entire SDF march: one closed-form solve per cube, O(1),
-// no loop, no step accumulation.
+//   1. The outer box face where the ray enters the cube shell (before sphere).
+//   2. The inner sphere surface where the ray re-enters the solid region after
+//      passing through the hollow cavity (sphere exit → box exit interval).
+//
+// We find both candidates and return the nearest positive one.
+//
+// All arithmetic is done in cube-local space where the box is [-s,+s]^3 and
+// the sphere has radius s*1.4, centred at the origin.
 
-struct ObbHit {
-    /// Entry distance along the ray; negative means no hit.
-    t:      f32,
-    /// Local-space hit point (used to derive the face normal).
-    lp:     vec3<f32>,
+struct HollowHit {
+    /// Ray parameter of the nearest surface, negative means no hit.
+    t:       f32,
+    /// Local-space hit point (used to derive the surface normal).
+    lp:      vec3<f32>,
+    /// true = hit the outer box face, false = hit the inner sphere cavity.
+    is_box:  bool,
 }
 
-fn ray_obb(ro: vec3<f32>, rd: vec3<f32>, fi: f32, t_scene: f32) -> ObbHit {
-    // Transform the ray into cube-local space by applying cube_local() to both
-    // a point on the ray and to the origin.  Because cube_local is an affine
-    // rigid transform (translate + two planar rotations) we can reconstruct the
-    // local direction as the difference of two transformed points.
-    let lo = cube_local(ro, fi, t_scene);
-    // A point one unit along the ray; subtract lo to get the local direction.
-    let ld = cube_local(ro + rd, fi, t_scene) - lo;
+fn ray_hollow_obb(ro: vec3<f32>, rd: vec3<f32>, fi: f32, t_scene: f32) -> HollowHit {
+    let no_hit = HollowHit(-1.0, vec3(0.0), true);
 
-    let s = u.size;
-    // Slab test: compute per-axis entry/exit distances.
-    // Guard against division by near-zero with a small epsilon.
+    // Transform ray into cube-local space (rigid: translate + two rotations).
+    let lo = cube_local(ro,       fi, t_scene);
+    let ld = cube_local(ro + rd,  fi, t_scene) - lo;  // local direction
+
+    let s  = u.size;
+    let sr = s * 1.4;  // sphere radius matching shader.wgsl
+
+    // ── Box slab interval [tbox_enter, tbox_exit] ────────────────────────
     let inv = vec3(
         select(1.0 / ld.x, 1e9, abs(ld.x) < 1e-7),
         select(1.0 / ld.y, 1e9, abs(ld.y) < 1e-7),
         select(1.0 / ld.z, 1e9, abs(ld.z) < 1e-7),
     );
-    let t0 = (-vec3(s) - lo) * inv;
-    let t1 = ( vec3(s) - lo) * inv;
-    let tmin3 = min(t0, t1);
-    let tmax3 = max(t0, t1);
-    let tenter = max(tmin3.x, max(tmin3.y, tmin3.z));
-    let texit  = min(tmax3.x, min(tmax3.y, tmax3.z));
+    let t0     = (-vec3(s) - lo) * inv;
+    let t1     = ( vec3(s) - lo) * inv;
+    let tmin3  = min(t0, t1);
+    let tmax3  = max(t0, t1);
+    let tbox_e = max(tmin3.x, max(tmin3.y, tmin3.z));  // entry
+    let tbox_x = min(tmax3.x, min(tmax3.y, tmax3.z));  // exit
 
-    if (texit < 0.0 || tenter > texit) {
-        return ObbHit(-1.0, vec3(0.0));
+    // Ray misses the box entirely.
+    if (tbox_x < 0.0 || tbox_e > tbox_x) { return no_hit; }
+
+    // ── Sphere interval [tsph_enter, tsph_exit] ──────────────────────────
+    // Quadratic: |lo + ld*t|^2 = sr^2
+    let a    = dot(ld, ld);
+    let b    = dot(lo, ld);
+    let c    = dot(lo, lo) - sr * sr;
+    let disc = b * b - a * c;
+
+    var tsph_e = -1e10;  // sphere entry (may be behind camera)
+    var tsph_x =  1e10;  // sphere exit
+
+    if (disc >= 0.0) {
+        let sq   = sqrt(disc);
+        tsph_e   = (-b - sq) / a;
+        tsph_x   = (-b + sq) / a;
     }
-    let lp = lo + ld * tenter;
-    return ObbHit(tenter, lp);
+
+    // ── Surface candidates ───────────────────────────────────────────────
+    //
+    // The hollow solid occupies:  inside box  AND  outside sphere.
+    // A ray through it can hit:
+    //   (A) Outer box face at tbox_e  - valid when tbox_e is outside the sphere
+    //       (i.e. the entry point is not already carved away).
+    //   (B) Inner sphere face at tsph_x - valid when tsph_x is inside the box
+    //       (the ray exits the hollow cavity and re-enters solid shell material).
+    //
+    // We evaluate both and take the nearest positive t.
+
+    var best_t   = 1e10;
+    var best_lp  = vec3(0.0);
+    var best_box = true;
+
+    // Candidate A: outer box entry face.
+    // Valid when the entry point lies outside the carved sphere.
+    if (tbox_e >= 0.0) {
+        let lp_a = lo + ld * tbox_e;
+        if (dot(lp_a, lp_a) >= sr * sr) {
+            best_t   = tbox_e;
+            best_lp  = lp_a;
+            best_box = true;
+        }
+    }
+
+    // Candidate B: inner sphere surface (ray exits cavity, hits far shell).
+    // Valid when tsph_x falls inside the box interval.
+    if (tsph_x >= 0.0 && tsph_x >= tbox_e && tsph_x <= tbox_x) {
+        if (tsph_x < best_t) {
+            best_t   = tsph_x;
+            best_lp  = lo + ld * tsph_x;
+            best_box = false;
+        }
+    }
+
+    if (best_t >= 1e9) { return no_hit; }
+    return HollowHit(best_t, best_lp, best_box);
 }
 
-// Derives the outward face normal from a local-space hit point.
-// The dominant axis of lp (clamped to [-size,+size]^3) identifies the face.
-fn obb_normal(lp: vec3<f32>) -> vec3<f32> {
+// ── Normal derivation ────────────────────────────────────────────────────────
+
+// Outer box face: dominant-axis normal (same as solid OBB).
+fn box_normal(lp: vec3<f32>) -> vec3<f32> {
     let a = abs(lp);
     if (a.x >= a.y && a.x >= a.z) { return vec3(sign(lp.x), 0.0, 0.0); }
     if (a.y >= a.x && a.y >= a.z) { return vec3(0.0, sign(lp.y), 0.0); }
     return vec3(0.0, 0.0, sign(lp.z));
+}
+
+// Inner sphere: inward-pointing normal (we see the inside of the cavity).
+fn sphere_normal_inner(lp: vec3<f32>) -> vec3<f32> {
+    return -normalize(lp);
+}
+
+// Rotates a local-space normal back to world space using the inverse of the
+// two-axis rotation applied by cube_local().
+fn local_to_world_normal(ln: vec3<f32>, fi: f32, t: f32) -> vec3<f32> {
+    var wn    = ln;
+    let rx_a  = t * u.speed * (0.2  + fi * 0.10);
+    let ry_a  = t * u.speed * (0.15 + fi * 0.05);
+    let wn_yz = rot(-ry_a) * wn.yz; wn.y = wn_yz.x; wn.z = wn_yz.y;
+    let wn_xz = rot(-rx_a) * wn.xz; wn.x = wn_xz.x; wn.z = wn_xz.y;
+    return wn;
 }
 
 // ── Scene traversal ──────────────────────────────────────────────────────────
@@ -156,25 +229,28 @@ struct SceneResult {
     t:      f32,
     cube_i: f32,
     lp:     vec3<f32>,
+    is_box: bool,
 }
 
 fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> SceneResult {
-    var best_t  = 1e10;
-    var best_i  = 0.0;
-    var best_lp = vec3(0.0);
-    var any_hit = false;
+    var best_t   = 1e10;
+    var best_i   = 0.0;
+    var best_lp  = vec3(0.0);
+    var best_box = true;
+    var any_hit  = false;
 
     for (var i = 0u; i < u.cube_count; i++) {
         let fi  = f32(i);
-        let hit = ray_obb(ro, rd, fi, t);
+        let hit = ray_hollow_obb(ro, rd, fi, t);
         if (hit.t > 0.0 && hit.t < best_t) {
-            best_t  = hit.t;
-            best_i  = fi;
-            best_lp = hit.lp;
-            any_hit = true;
+            best_t   = hit.t;
+            best_i   = fi;
+            best_lp  = hit.lp;
+            best_box = hit.is_box;
+            any_hit  = true;
         }
     }
-    return SceneResult(any_hit, best_t, best_i, best_lp);
+    return SceneResult(any_hit, best_t, best_i, best_lp, best_box);
 }
 
 // ── OSD (identical to shader.wgsl) ───────────────────────────────────────────
@@ -321,23 +397,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3(0.01, 0.02, 0.05), vec3(0.05, 0.08, 0.15), in.uv.y * 0.5 + 0.5)
               + grain * 0.04;
     } else {
-        // Derive world-space normal from local-space dominant face, then light it.
-        let ln        = obb_normal(result.lp);
-        // Rotate the local normal back to world space using the same two-axis
-        // rotation so it points correctly for the key-light dot product.
-        var wn        = ln;
-        let fi        = result.cube_i;
-        let rx_a      = t * u.speed * (0.2  + fi * 0.10);
-        let ry_a      = t * u.speed * (0.15 + fi * 0.05);
-        // Inverse (transpose) of rot() to go local → world.
-        let rx_inv    = rot(-rx_a);
-        let ry_inv    = rot(-ry_a);
-        let wn_yz     = ry_inv * wn.yz; wn.y = wn_yz.x; wn.z = wn_yz.y;
-        let wn_xz     = rx_inv * wn.xz; wn.x = wn_xz.x; wn.z = wn_xz.y;
+        let fi       = result.cube_i;
+        let base_col = cube_color(fi);
 
-        let light     = max(dot(wn, normalize(vec3(1.0, 2.0, 1.0))), 0.2);
-        let base_col  = cube_color(fi);
-        color = base_col * light + grain * 0.03;
+        // Derive surface normal in local space then rotate to world space.
+        let ln = select(
+            sphere_normal_inner(result.lp),
+            box_normal(result.lp),
+            result.is_box,
+        );
+        let wn    = local_to_world_normal(ln, fi, t);
+        let light = max(dot(wn, normalize(vec3(1.0, 2.0, 1.0))), 0.2);
+
+        // Inner sphere cavity gets the complementary hue tint, matching the
+        // visual language of the high-end inner-shape shading.
+        let inner_col = cube_color(fi + 3.5);
+        let face_col  = select(inner_col * 1.3, base_col, result.is_box);
+
+        color = face_col * light + grain * 0.03;
     }
 
     let osd     = osd_mask((in.clip_position.xy - vec2(8.0, 8.0)) / OSD_SCALE);
