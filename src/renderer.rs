@@ -6,6 +6,7 @@ use winit::window::Window;
 
 use crate::args::Args;
 use crate::benchmark::BenchmarkState;
+use crate::gpu_tier::GpuTier;
 use crate::gpu_timer::GpuTimer;
 use crate::metrics::{
     FrameMetrics, PacingAnalyzer, write_csv_row, write_frame_log_row, write_json_row,
@@ -305,11 +306,10 @@ impl<'a> State<'a> {
         };
         surface.configure(&device, &config);
 
+        let gpu_tier = GpuTier::resolve(&adapter, args.shader.as_deref());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "shader.wgsl"
-            ))),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(gpu_tier.shader_source())),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

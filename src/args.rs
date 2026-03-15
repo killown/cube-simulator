@@ -62,4 +62,19 @@ pub struct Args {
     /// Maximum cube count to probe in benchmark mode (default: 64).
     #[arg(long, default_value_t = 64)]
     pub bench_max: u32,
+    /// Override the automatic shader selection.
+    ///
+    /// Accepted values: `high` (raymarched SDF, full quality) or
+    /// `low` (analytic raster, reduced workload).
+    ///
+    /// By default the shader is chosen automatically from adapter capabilities.
+    /// Use `--shader low` on a high-end GPU to test the low-end path, or
+    /// `--shader high` to force the full pipeline even on hardware that would
+    /// normally be classified as low-end.
+    ///
+    /// The startup banner always shows which shader was actually loaded and
+    /// whether the selection came from auto-detection or a manual override.
+    /// Benchmark results are NOT comparable between the two variants.
+    #[arg(long, value_name = "VARIANT", value_parser = ["high", "low"])]
+    pub shader: Option<String>,
 }
