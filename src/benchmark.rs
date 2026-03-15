@@ -18,6 +18,106 @@ pub struct BenchStepResult {
     pub trigger: Option<BenchTrigger>,
 }
 
+/// Composite score produced at the end of a benchmark sweep.
+///
+/// # Formula
+///
+/// ```text
+/// score = (clean_cubes × POINTS_PER_CLEAN_CUBE)
+///       + (trigger_cube × trigger_multiplier)   -- 0 on perfect sweep
+///       + PERFECT_BONUS                          -- only on perfect sweep
+/// ```
+///
+/// Each cube count that completes the full measurement window without any
+/// vblank signal contributes a flat `POINTS_PER_CLEAN_CUBE`.  When a trigger
+/// fires, the cube count at which it fired is multiplied by a severity-
+/// dependent factor: yellow (isolated miss) scores higher than red (sustained
+/// EMA pressure) because a single transient miss is meaningfully less severe
+/// than a regime of consistent delivery failure.
+///
+/// A perfect sweep, no trigger across all tested cube counts, receives a
+/// flat `PERFECT_BONUS` on top of the clean-pass points, rewarding hardware
+/// that never loses vblank sync regardless of cube count.
+///
+/// # Comparability
+///
+/// Scores are only comparable between runs using the **same shader variant**
+/// (high-end vs low-end), the same `--bench-secs`, and the same `--bench-max`.
+/// The startup banner and the score footer both print the active shader so
+/// mixed comparisons cannot happen silently.
+#[derive(Debug, Clone)]
+pub struct BenchScore {
+    /// Total composite score.
+    pub total: u32,
+    /// Points contributed by clean-pass cube counts.
+    pub clean_points: u32,
+    /// Points contributed by the trigger event (0 on a perfect sweep).
+    pub trigger_points: u32,
+    /// Flat bonus awarded only when the sweep completes without any trigger.
+    pub perfect_bonus: u32,
+    /// Number of cube counts that completed cleanly.
+    pub clean_cubes: u32,
+    /// Cube count and trigger type where the sweep ended, if any.
+    pub trigger: Option<(u32, BenchTrigger)>,
+}
+
+/// Points per cube count that passed the full measurement window cleanly.
+const POINTS_PER_CLEAN_CUBE: u32 = 100;
+/// Multiplier on the trigger cube count for a yellow (isolated vblank miss).
+const YELLOW_TRIGGER_MULTIPLIER: u32 = 40;
+/// Multiplier on the trigger cube count for a red (sustained EMA pressure).
+const RED_TRIGGER_MULTIPLIER: u32 = 10;
+/// Flat bonus awarded when the entire sweep completes with no trigger at all.
+const PERFECT_BONUS: u32 = 500;
+
+impl BenchScore {
+    /// Computes the score from the completed result set.
+    ///
+    /// `results` must be the final slice from [`BenchmarkState`]; the last
+    /// entry may or may not carry a trigger.
+    fn compute(results: &[BenchStepResult]) -> Self {
+        let clean_cubes = results.iter().filter(|r| r.trigger.is_none()).count() as u32;
+        let clean_points = clean_cubes * POINTS_PER_CLEAN_CUBE;
+
+        let trigger_entry = results.iter().find(|r| r.trigger.is_some());
+
+        let (trigger_points, perfect_bonus, trigger) = match trigger_entry {
+            None => (0, PERFECT_BONUS, None),
+            Some(r) => {
+                let t = r.trigger.unwrap();
+                let mult = match t {
+                    BenchTrigger::Yellow => YELLOW_TRIGGER_MULTIPLIER,
+                    BenchTrigger::Red => RED_TRIGGER_MULTIPLIER,
+                };
+                (r.cube_count * mult, 0, Some((r.cube_count, t)))
+            }
+        };
+
+        let total = clean_points + trigger_points + perfect_bonus;
+
+        Self {
+            total,
+            clean_points,
+            trigger_points,
+            perfect_bonus,
+            clean_cubes,
+            trigger,
+        }
+    }
+
+    /// Returns a short letter grade that maps score ranges to an intuitive
+    /// tier label, useful for quick cross-machine comparisons.
+    fn grade(&self) -> &'static str {
+        match self.total {
+            4500.. => "S",
+            3000..=4499 => "A",
+            1500..=2999 => "B",
+            500..=1499 => "C",
+            _ => "D",
+        }
+    }
+}
+
 /// Phase of a single benchmark step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepPhase {
@@ -252,6 +352,40 @@ impl BenchmarkState {
             }
         }
 
+        // ── Score ─────────────────────────────────────────────────────────
+        let score = BenchScore::compute(&self.results);
+        println!("\n──────────────────────────────────────────");
+        println!("  SCORE");
+        println!("──────────────────────────────────────────");
+        println!("  Grade          : {}", score.grade());
+        println!("  Total          : {}", score.total);
+        println!(
+            "  Clean passes   : {} cubes × {} pts = {}",
+            score.clean_cubes, POINTS_PER_CLEAN_CUBE, score.clean_points
+        );
+
+        match score.trigger {
+            None => {
+                println!("  Perfect bonus  : +{}", score.perfect_bonus);
+            }
+            Some((cube, BenchTrigger::Yellow)) => {
+                println!(
+                    "  Yellow trigger : {} cubes × {} pts = {}",
+                    cube, YELLOW_TRIGGER_MULTIPLIER, score.trigger_points
+                );
+            }
+            Some((cube, BenchTrigger::Red)) => {
+                println!(
+                    "  Red trigger    : {} cubes × {} pts = {}",
+                    cube, RED_TRIGGER_MULTIPLIER, score.trigger_points
+                );
+            }
+        }
+
+        println!("──────────────────────────────────────────");
+        println!("  NOTE: scores are comparable only between");
+        println!("  runs with the same shader, --bench-secs,");
+        println!("  and --bench-max values.");
         println!("══════════════════════════════════════════\n");
     }
 }
