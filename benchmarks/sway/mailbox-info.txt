@@ -1,5 +1,0 @@
-Command: target/release/frame-test -c 120 -m mailbox --csv /home/neo/Git/cube-simulator/benchmarks/sway/mailbox.csv
-HDMI-A-1: 1920x1080 @ 60Hz (VRR: Off)
-Max Render Time: default
-Surface Format: Bgra8UnormSrgb
-Present Mode: Mailbox

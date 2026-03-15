@@ -1,4 +1,0 @@
-Command: target/release/frame-test -c 120 -m fifo --csv /home/neo/Git/cube-simulator/benchmarks/wayfire/fifo.csv
-HDMI-A-1: 1920x1080 @ 165Hz (VRR: On)
-Surface Format: Bgra8UnormSrgb
-Present Mode: Fifo
