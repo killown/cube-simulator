@@ -108,6 +108,25 @@ struct MicroTimerInner {
     pub last_timings: Option<MicroTimings>,
 }
 
+impl Drop for GpuTimerInner {
+    /// Unmaps the readback buffer if it was left in `Mapped` state when the
+    /// device is torn down, preventing the "buffer destroyed while mapped" panic.
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Relaxed) == STATE_MAPPED {
+            self.readback_buf.unmap();
+        }
+    }
+}
+
+impl Drop for MicroTimerInner {
+    /// Same teardown guard as `GpuTimerInner::drop`.
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Relaxed) == STATE_MAPPED {
+            self.readback_buf.unmap();
+        }
+    }
+}
+
 impl GpuTimer {
     /// Creates a `GpuTimer` for `device`/`queue`.
     ///
@@ -288,22 +307,20 @@ impl GpuTimer {
                 });
         }
 
-        if let Some(micro) = inner
-            .micro
-            .as_mut()
-            .filter(|m| m.state.load(Ordering::Relaxed) == STATE_IDLE)
-        {
-            micro.state.store(STATE_PENDING, Ordering::Relaxed);
-            let state = Arc::clone(&micro.state);
-            micro
-                .readback_buf
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |r| {
-                    state.store(
-                        if r.is_ok() { STATE_MAPPED } else { STATE_IDLE },
-                        Ordering::Relaxed,
-                    );
-                });
+        if let Some(micro) = inner.micro.as_mut() {
+            if micro.state.load(Ordering::Relaxed) == STATE_IDLE {
+                micro.state.store(STATE_PENDING, Ordering::Relaxed);
+                let state = Arc::clone(&micro.state);
+                micro
+                    .readback_buf
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| {
+                        state.store(
+                            if r.is_ok() { STATE_MAPPED } else { STATE_IDLE },
+                            Ordering::Relaxed,
+                        );
+                    });
+            }
         }
     }
 
@@ -362,34 +379,33 @@ impl GpuTimer {
         //   shader_ms   = last_gpu_time_ms (outer timer, one-frame lag, same workload)
         //   resolve_ms  = fixed ~0.05ms typical for GFX1200 (no inner bracket available)
         //   driver_ms   = total_ms − shader_ms − resolve_ms
-        if let Some(micro) = inner
-            .micro
-            .as_mut()
-            .filter(|m| m.state.load(Ordering::Relaxed) == STATE_MAPPED)
-        {
-            let timings = {
-                let view = micro.readback_buf.slice(..).get_mapped_range();
-                let ts: &[u64] = bytemuck::cast_slice(&view);
-                (ts.len() >= 2 && ts[1] >= ts[0]).then(|| {
-                    let total_ms = (ts[1] - ts[0]) as f32 * period / 1_000_000.0;
-                    let shader_ms = inner.last_gpu_time_ms.unwrap_or(0.0);
-                    let overhead_ms = (total_ms - shader_ms).max(0.0);
-                    let resolve_ms = overhead_ms.min(0.05);
-                    let driver_ms = (overhead_ms - resolve_ms).max(0.0);
-
-                    MicroTimings {
-                        driver_overhead_ms: driver_ms,
-                        shader_ms,
-                        resolve_ms,
-                        total_ms,
+        if let Some(micro) = inner.micro.as_mut() {
+            if micro.state.load(Ordering::Relaxed) == STATE_MAPPED {
+                let timings = {
+                    let view = micro.readback_buf.slice(..).get_mapped_range();
+                    let ts: &[u64] = bytemuck::cast_slice(&view);
+                    if ts.len() >= 2 && ts[1] >= ts[0] {
+                        let total_ms = (ts[1] - ts[0]) as f32 * period / 1_000_000.0;
+                        let shader_ms = inner.last_gpu_time_ms.unwrap_or(0.0);
+                        let overhead_ms = (total_ms - shader_ms).max(0.0);
+                        let resolve_ms = overhead_ms.min(0.05);
+                        let driver_ms = (overhead_ms - resolve_ms).max(0.0);
+                        Some(MicroTimings {
+                            driver_overhead_ms: driver_ms,
+                            shader_ms,
+                            resolve_ms,
+                            total_ms,
+                        })
+                    } else {
+                        None
                     }
-                })
-            };
+                };
 
-            micro.readback_buf.unmap();
-            micro.state.store(STATE_IDLE, Ordering::Relaxed);
-            if let Some(t) = timings {
-                micro.last_timings = Some(t);
+                micro.readback_buf.unmap();
+                micro.state.store(STATE_IDLE, Ordering::Relaxed);
+                if let Some(t) = timings {
+                    micro.last_timings = Some(t);
+                }
             }
         }
     }
