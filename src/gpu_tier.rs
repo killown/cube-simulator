@@ -154,6 +154,32 @@ impl GpuTier {
         }
 
         println!("╚{border}╝\n");
+
+        //FIXME: Consider removing the low shader option.
+        // Instead, inform users that the tool may not function correctly on non-discrete GPUs,
+        // as the FPS data for low-end shaders is inherently unreliable.
+        if matches!(self, Self::LowEnd) {
+            eprintln!(
+                "WHY FPS IS UNRELIABLE WITH THE LOW-END SHADER\n\
+                 ──────────────────────────────────────────────\n\
+                 The low-end shader exits early when a ray misses a cube's\n\
+                 bounding box. This makes GPU cost depend on the animation\n\
+                 state, not just cube count. When cubes are spread apart,\n\
+                 rays exit early and the frame is cheap. When cubes cluster\n\
+                 together, more intersection math runs and the frame is\n\
+                 expensive. This causes FPS to swing 20-40% between frames\n\
+                 for the same -c value.\n\
+                 \n\
+                 As a result, -c 5 can be slower than -c 6 at any given\n\
+                 moment, and the LOW 1% FPS reflects animation luck as much\n\
+                 as hardware capability.\n\
+                 \n\
+                 The high-end shader does not have this problem: its SDF\n\
+                 loop always runs steps x cube_count x pixels, constant\n\
+                 regardless of where the cubes are. Use it for any real\n\
+                 compositor or performance measurement.\n"
+            );
+        }
     }
 }
 

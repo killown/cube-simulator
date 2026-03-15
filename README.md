@@ -248,3 +248,40 @@ readback. Discard these cold-start lines.
 Once shader time is populated, the labels are accurate. A healthy session
 under manageable load shows no `[MICRO]` output at all. Lines only appear
 when a vblank is actually missed.
+
+### Why FPS is unreliable with the low-end shader
+
+The low-end shader uses an analytic ray-box intersection to render each cube.
+Unlike the high-end raymarcher, which always evaluates every cube for every
+pixel regardless of what the scene looks like, the low-end shader can exit
+early when a ray misses a cube's bounding box entirely.
+
+This sounds like an optimisation, and it is, but it makes the GPU cost
+**dependent on the current animation frame**, not just the cube count.
+
+When cubes are spread far apart, most rays miss most cubes and the early exits
+fire frequently. When cubes happen to cluster together or align with the camera,
+more rays enter more bounding boxes and the full intersection math runs. The
+cost of a single frame can swing by 20–40% between these two extremes.
+
+Since the cubes animate continuously, this variance shows up directly as FPS
+instability. Two consecutive seconds at the same `-c` value can produce
+noticeably different frame times just because the scene moved. More
+counterintuitively, **`-c 5` can be slower than `-c 6`** at a given moment
+because five widely-spaced cubes force more rays to traverse the full scene
+depth than six cubes that happen to cluster and occlude each other.
+
+**This makes the LOW 1% FPS figure meaningless as a compositor diagnostic.**
+The 1% lows will reflect animation configuration as much as compositor
+behaviour, so two runs with identical hardware and compositors can produce
+different LOW scores just because they started at different times.
+
+The high-end raymarcher does not have this problem. Its SDF loop always runs
+`--steps` iterations for every pixel and evaluates every cube on every
+iteration, the cost is strictly `steps × cube_count × pixel_count`, constant
+regardless of scene geometry. This is why it is the correct shader for any
+real compositor pressure test or benchmark.
+
+The low-end shader exists only to provide a usable visual on hardware that
+cannot sustain the raymarcher at even `-c 1`. If your hardware can run the
+high-end shader at all, use it.
