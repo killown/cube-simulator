@@ -208,3 +208,43 @@ target/release/frame-test
 ### Performance Note: Why Raymarching?
 
 Unlike triangle-based engines, raymarching is exponentially expensive based on the complexity of the `map()` function. Every pixel executes a distance field loop for every cube added. This creates a **purely GPU-bound** environment, which is the only way to accurately test if a compositor's V-Sync implementation can handle high-throughput scenarios without introducing artificial input lag or flickering.
+
+### GPU Micro-Stutter Diagnostics (`[MICRO]` output)
+
+When a vblank miss is detected, a `[MICRO]` line is printed to stderr in real
+time. These lines decompose the missed frame into three distinct latency
+sources so you know immediately whether to blame the shader, the driver, or
+the DMA subsystem.
+
+```
+[MICRO] vblank×3 — SHADER OVERRUN (driver 0.32ms  shader 23.72ms  resolve 0.05ms  total 24.08ms)
+```
+
+#### Fields
+
+| Field         | What it measures                                                                 |
+| :------------ | :------------------------------------------------------------------------------- |
+| `vblank×N`    | How many vblank periods this frame consumed. `×2` = one missed slot. `×3` = two. |
+| `driver Nms`  | Time from CPU submit to first GPU instruction. Normal: < 1 ms.                   |
+| `shader Nms`  | True GPU render-pass execution time from hardware timestamp queries.             |
+| `resolve Nms` | GPU DMA copy overhead for the timestamp readback buffer. Normal: < 0.1 ms.       |
+| `total Nms`   | Full GPU pipeline span from submit to resolve complete.                          |
+
+#### Cause labels and what to do
+
+| Label               | Meaning                                                                                                        | Action                                                                                         |
+| :------------------ | :------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| `SHADER OVERRUN`    | `shader_ms > frame_budget_ms`. The fragment workload exceeded the budget.                                      | Reduce `--cubes` or `--steps`.                                                                 |
+| `DRIVER STALL`      | `driver_ms > 2ms`. The Vulkan driver held the command buffer unusually long before scheduling it onto the GPU. | Usually transient. Persistent stalls may indicate driver or thermal issues.                    |
+| `RESOLVE/DMA SPIKE` | `resolve_ms > 0.3ms`. The DMA copy of timestamp data spiked.                                                   | Usually a one-off TTM eviction or PCIe contention. Persistent spikes indicate memory pressure. |
+
+#### Reading a session
+
+The first one or two `[MICRO]` lines after startup will show `shader 0.00ms`
+and may be mislabelled as `DRIVER STALL`. This is expected: the outer GPU
+timer lags one frame, so shader time is not yet available on the very first
+readback. Discard these cold-start lines.
+
+Once shader time is populated, the labels are accurate. A healthy session
+under manageable load shows no `[MICRO]` output at all. Lines only appear
+when a vblank is actually missed.

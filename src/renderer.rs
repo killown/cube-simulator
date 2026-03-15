@@ -69,6 +69,9 @@ pub struct State<'a> {
     /// Hardware GPU execution timer. Wraps a `TIMESTAMP_QUERY` `QuerySet`; is a
     /// zero-cost no-op when the adapter does not support the feature.
     gpu_timer: GpuTimer,
+    /// Last printed `raw_vblank_mul`; suppresses duplicate `[MICRO]` lines when
+    /// two consecutive WSI deltas both reflect the same overrun event.
+    last_micro_vblank_mul: u32,
 }
 
 /// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
@@ -76,7 +79,7 @@ pub struct State<'a> {
 /// that `submit_ns, present_ts` produces an accurate `slack_ms` without any
 /// anchor arithmetic.
 ///
-/// Falls back to `0` only on platforms where the syscall is unavailable, the
+/// Falls back to `0` only on platforms where the syscall is unavailable; the
 /// caller treats `0` as `None` in the pacing filter (`gap_ms > 0.0`).
 #[cfg(target_os = "linux")]
 #[inline]
@@ -147,11 +150,11 @@ impl<'a> State<'a> {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                // Request all three timestamp features when available; GpuTimer
-                // degrades independently for each so missing any never fails the request.
+                // TIMESTAMP_QUERY: outer render-pass timer (shader time).
+                // TIMESTAMP_QUERY_INSIDE_ENCODERS: encoder brackets for driver
+                // overhead and DMA resolve time. Both degrade silently if absent.
                 required_features: adapter.features()
                     & (wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
                 ..Default::default()
             })
@@ -386,6 +389,7 @@ impl<'a> State<'a> {
             benchmark_done: false,
             any_vblank_miss_this_frame: false,
             gpu_timer,
+            last_micro_vblank_mul: 0,
         }
     }
 
@@ -458,8 +462,8 @@ impl<'a> State<'a> {
         // so the GPU sees them in order: [resolve N-1] → [render pass N].
         self.gpu_timer.resolve(&mut encoder);
 
-        // MICRO_SLOT_SUBMIT_PRE: marks the start of GPU command processing.
-        // Gap to PASS_BEGIN isolates driver submission latency from shader time.
+        // MICRO_SLOT_SUBMIT_PRE: marks when the GPU starts processing this
+        // command buffer. Gap to PASS_BEGIN = driver submission latency.
         self.gpu_timer.write_pre_pass(&mut encoder);
 
         {
@@ -534,32 +538,38 @@ impl<'a> State<'a> {
                 });
                 self.last_pres_ts = Some(now_ns);
 
-                // Feed the raw timestamp into the pacing analyzer before the
-                // 500ms tick gate so every individual frame's phase drift and
-                // sync score are captured and logged at full frame resolution.
-                pacing_record =
-                    self.pacing
-                        .push(now_ns, Some(cpu_frame_ms), Some(cpu_submit_ns), gpu_time_ms);
+                // Compute a raw vblank multiplier directly from the WSI delta
+                // before feeding it into the pacing analyzer. The analyzer may
+                // discard this frame (first frame, clock discontinuity, or
+                // delta > 3×ideal_ms on a severe GPU overrun), but the micro-
+                // stutter diagnosis must fire unconditionally on any missed vblank.
+                let ideal_ms = self.metrics.frame_budget_ms;
+                let raw_vblank_mul = if let Some(d) = delta {
+                    if d > ideal_ms * 1.25 {
+                        (d / ideal_ms).round() as u32
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
 
-                if let Some(record) = &pacing_record {
-                    let live_cube_count = self
-                        .benchmark
-                        .as_ref()
-                        .map_or(self.args.cubes, |b| b.current_cubes);
-                    write_frame_log_row(&mut self.frame_log_file, record, live_cube_count);
+                // Suppress [MICRO] output for the first 3 seconds after startup.
+                // The outer GPU timer lags one frame on cold start so shader_ms
+                // reads 0.00ms, producing misleading DRIVER STALL labels that are
+                // purely an artefact of the readback pipeline warming up.
+                const MICRO_WARMUP_SECS: f32 = 3.0;
 
-                    // Any single missed vblank is a yellow warning, a momentary ping.
-                    if record.vblank_mul > 1 {
-                        self.pacing_decay = 1.0;
-                        self.any_vblank_miss_this_frame = true;
-
-                        // When micro-timings are available, print a one-line root-cause
-                        // diagnosis so the user knows whether the miss was caused by the
-                        // GPU shader, the driver stalling the command buffer, or DMA/PCIe
-                        // resolve overhead, three failure modes that look identical from
-                        // vblank_mul alone.
-                        if let Some(m) = micro {
-                            let cause = if m.driver_overhead_ms > 0.5 {
+                if raw_vblank_mul > 1 {
+                    if let Some(m) = micro {
+                        let elapsed = self.start_time.elapsed().as_secs_f32();
+                        // Print only when vblank_mul changes value: suppresses the
+                        // duplicate that appears when two consecutive WSI deltas both
+                        // reflect the same overrun (overrun frame + recovery frame).
+                        if elapsed >= MICRO_WARMUP_SECS
+                            && raw_vblank_mul != self.last_micro_vblank_mul
+                        {
+                            let cause = if m.driver_overhead_ms > 2.0 {
                                 "DRIVER STALL"
                             } else if m.resolve_ms > 0.3 {
                                 "RESOLVE/DMA SPIKE"
@@ -569,7 +579,7 @@ impl<'a> State<'a> {
                             eprintln!(
                                 "[MICRO] vblank×{} — {} \
                                  (driver {:.2}ms  shader {:.2}ms  resolve {:.2}ms  total {:.2}ms)",
-                                record.vblank_mul,
+                                raw_vblank_mul,
                                 cause,
                                 m.driver_overhead_ms,
                                 m.shader_ms,
@@ -577,6 +587,33 @@ impl<'a> State<'a> {
                                 m.total_ms,
                             );
                         }
+                        self.last_micro_vblank_mul = raw_vblank_mul;
+                    }
+                } else {
+                    self.last_micro_vblank_mul = 0;
+                }
+
+                // Feed the raw timestamp into the pacing analyzer before the
+                // 500ms tick gate so every individual frame's phase drift and
+                // sync score are captured and logged at full frame resolution.
+                pacing_record = self.pacing.push(
+                    now_ns,
+                    Some(cpu_frame_ms),
+                    Some(cpu_submit_ns),
+                    gpu_time_ms,
+                    micro,
+                );
+
+                if let Some(record) = &pacing_record {
+                    let live_cube_count = self
+                        .benchmark
+                        .as_ref()
+                        .map_or(self.args.cubes, |b| b.current_cubes);
+                    write_frame_log_row(&mut self.frame_log_file, record, live_cube_count);
+
+                    if record.vblank_mul > 1 {
+                        self.pacing_decay = 1.0;
+                        self.any_vblank_miss_this_frame = true;
                     }
 
                     // EMA breach is the severe regime, fire red and let it linger.
