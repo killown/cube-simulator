@@ -289,6 +289,17 @@ impl BenchmarkState {
         });
     }
 
+    /// Returns `true` when the current step is in the measurement window.
+    ///
+    /// During warmup this returns `false`; transitions to `true` once the
+    /// warmup period elapses.  The renderer uses this to freeze animation
+    /// (`speed = 0`) on the low-end shader so OBB early-exit variance is
+    /// eliminated from the benchmark signal.
+    #[inline]
+    pub fn is_measuring(&self) -> bool {
+        self.phase == StepPhase::Measuring
+    }
+
     /// Prints the final human-readable benchmark report to stdout.
     ///
     /// Should be called after [`BenchmarkState::is_done`] returns `true`,

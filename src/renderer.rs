@@ -69,6 +69,9 @@ pub struct State<'a> {
     /// Hardware GPU execution timer. Wraps a `TIMESTAMP_QUERY` `QuerySet`; is a
     /// zero-cost no-op when the adapter does not support the feature.
     gpu_timer: GpuTimer,
+    /// Shader tier selected at startup; used to gate benchmark-mode animation
+    /// freeze to the low-end shader only (the high-end SDF cost is position-invariant).
+    gpu_tier: GpuTier,
     /// Last printed `raw_vblank_mul`; suppresses duplicate `[MICRO]` lines when
     /// two consecutive WSI deltas both reflect the same overrun event.
     last_micro_vblank_mul: u32,
@@ -396,6 +399,7 @@ impl<'a> State<'a> {
             benchmark_done: false,
             any_vblank_miss_this_frame: false,
             gpu_timer,
+            gpu_tier,
             last_micro_vblank_mul: 0,
         }
     }
@@ -698,6 +702,24 @@ impl<'a> State<'a> {
                     self.current_uniforms.cube_count = new_count;
                     self.uniform_binding
                         .write(&self.queue, &self.current_uniforms);
+                }
+
+                // Freeze animation during measurement windows on the low-end
+                // shader only.  The OBB early-exit cost varies with cube
+                // positions, freezing eliminates that variance so GPU cost is
+                // strictly proportional to cube_count.  The high-end SDF loop
+                // is position-invariant so freezing is not needed there.
+                if self.gpu_tier == GpuTier::LowEnd {
+                    let target_speed = if bench.is_measuring() {
+                        0.0
+                    } else {
+                        self.args.speed
+                    };
+                    if self.current_uniforms.speed != target_speed {
+                        self.current_uniforms.speed = target_speed;
+                        self.uniform_binding
+                            .write(&self.queue, &self.current_uniforms);
+                    }
                 }
             }
         }
