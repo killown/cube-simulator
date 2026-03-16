@@ -20,6 +20,7 @@ struct Uniforms {
     gpu_time_ms:   f32,
     sync_score:    f32,
     cpu_time_ms:   f32,
+    slack_ms:      f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -348,6 +349,7 @@ fn osd_mask(frag: vec2<f32>) -> f32 {
     d = max(d, osd_row(7.0, 29263, 31689, 23407, u.cpu_time_ms, 2, frag)); // CPU
     d = max(d, osd_row(8.0, 29551, 31689, 23407, u.gpu_time_ms, 2, frag)); // GPU
     d = max(d, osd_row(9.0, 29671, 23506, 24557, u.sync_score,  1, frag)); // SYN
+    d = max(d, osd_row(10.0, 29671, 4687, 11245, u.slack_ms,    2, frag)); // SLA
     return step(0.5, d);
 }
 

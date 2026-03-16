@@ -23,7 +23,8 @@ use crate::args::Args;
 /// offset 76: gpu_time_ms   f32
 /// offset 80: sync_score    f32
 /// offset 84: cpu_time_ms   f32
-/// offset 88: _pad          [f32; 6]
+/// offset 88: slack_ms      f32
+/// offset 92: _pad          [f32; 5]
 /// ```
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -51,7 +52,8 @@ pub struct ShaderUniforms {
     pub gpu_time_ms: f32,
     pub sync_score: f32,
     pub cpu_time_ms: f32,
-    pub _pad: [f32; 6],
+    pub slack_ms: f32,
+    pub _pad: [f32; 5],
 }
 
 impl ShaderUniforms {
@@ -71,7 +73,8 @@ impl ShaderUniforms {
             gpu_time_ms: 0.0,
             sync_score: 0.0,
             cpu_time_ms: 0.0,
-            _pad: [0.0; 6],
+            slack_ms: 0.0,
+            _pad: [0.0; 5],
         }
     }
 
@@ -93,6 +96,7 @@ impl ShaderUniforms {
         gpu_time_ms: f32,
         sync_score: f32,
         cpu_time_ms: f32,
+        slack_ms: f32,
     ) -> Self {
         Self {
             color: [args.red, args.green, args.blue, 1.0],
@@ -108,7 +112,8 @@ impl ShaderUniforms {
             gpu_time_ms,
             sync_score,
             cpu_time_ms,
-            _pad: [0.0; 6],
+            slack_ms,
+            _pad: [0.0; 5],
         }
     }
 }

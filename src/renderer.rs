@@ -91,6 +91,8 @@ pub struct State<'a> {
     /// Set to `true` the first time `flip_tracker.healthy` transitions to `false`,
     /// so the warning is logged exactly once rather than every frame.
     flip_tracker_warned: bool,
+    /// Last measured slack_ms (time from submit to presentation).
+    slack_ms: f32,
 }
 
 /// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
@@ -435,6 +437,7 @@ impl<'a> State<'a> {
             flip_tracker,
             gpu_end_ns: None,
             flip_tracker_warned: false,
+            slack_ms: 0.0,
         }
     }
 
@@ -690,6 +693,9 @@ impl<'a> State<'a> {
                 );
 
                 if let Some(record) = &pacing_record {
+                    if let Some(s) = record.slack_ms {
+                        self.slack_ms = s;
+                    }
                     let live_cube_count = self
                         .benchmark
                         .as_ref()
@@ -750,6 +756,7 @@ impl<'a> State<'a> {
                     .map(|r| r.sync_score)
                     .unwrap_or(self.current_uniforms.sync_score),
                 cpu_frame_ms,
+                self.slack_ms,
             );
 
             self.uniform_binding

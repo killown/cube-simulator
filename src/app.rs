@@ -46,6 +46,7 @@ impl<'a> ApplicationHandler for App<'a> {
             CPU:  CPU frame time (ms)\n\
             GPU:  GPU render time (ms)\n\
             SYN:  Vblank alignment sync score (0-100)\n\
+            SLA:  Slack (ms)\n\
             =============="
         );
     }
