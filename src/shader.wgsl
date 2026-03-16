@@ -17,6 +17,7 @@ struct Uniforms {
     sync_score:    f32,
     cpu_time_ms:   f32,
     slack_ms:      f32,
+    sync_var:      f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -156,7 +157,7 @@ fn inner_sdf(q_cube: vec3<f32>, cube_i: f32, t: f32) -> f32 {
     else if (kind == 1) { return sd_box_inner(q, vec3(s * 0.65)); }        // cube
     else if (kind == 2) { return sd_torus(q, s * 0.52, s * 0.22); }       // torus
     else if (kind == 3) { return sd_capsule(q, s * 0.50, s * 0.25); }     // capsule
-    else if (kind == 4) { return sd_octahedron(q, s * 1.05); }            // octahedron
+    else if (kind == 4) { return sd_octahedron(q, s * 1.05); }             // octahedron
     else                { return sd_cross(q, s * 0.70, s * 0.22); }       // cross
 }
 
@@ -330,6 +331,7 @@ fn osd_mask(frag: vec2<f32>) -> f32 {
     d = max(d, osd_row(8.0, 29551, 31689, 23407, u.gpu_time_ms, 2, frag)); // GPU
     d = max(d, osd_row(9.0, 29671, 23506, 24557, u.sync_score,  1, frag)); // SYN
     d = max(d, osd_row(10.0, 29671, 4687, 11245, u.slack_ms,    2, frag)); // SLA
+    d = max(d, osd_row(11.0, 29671, 23378, 11245, u.sync_var,   2, frag)); // SVA
     return step(0.5, d);
 }
 

@@ -721,6 +721,16 @@ impl<'a> State<'a> {
 
         let presentation_ts: Option<u64> = self.last_pres_ts.filter(|_| wsi_delta_ms.is_some());
 
+        let sync_score = pacing_record
+            .as_ref()
+            .map(|r| r.sync_score)
+            .unwrap_or(self.current_uniforms.sync_score);
+
+        self.metrics.sync_scores.push_back(sync_score);
+        if self.metrics.sync_scores.len() > self.metrics.sync_scores.capacity() {
+            self.metrics.sync_scores.pop_front();
+        }
+
         if let Some(stats) = self.metrics.push(
             total_frame_delta,
             self.args.threshold,
@@ -757,6 +767,7 @@ impl<'a> State<'a> {
                     .unwrap_or(self.current_uniforms.sync_score),
                 cpu_frame_ms,
                 self.slack_ms,
+                stats.sync_var,
             );
 
             self.uniform_binding

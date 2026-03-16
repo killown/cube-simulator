@@ -53,6 +53,7 @@ pub struct ShaderUniforms {
     pub sync_score: f32,
     pub cpu_time_ms: f32,
     pub slack_ms: f32,
+    pub sync_var: f32,
     pub _pad: [f32; 5],
 }
 
@@ -74,6 +75,7 @@ impl ShaderUniforms {
             sync_score: 0.0,
             cpu_time_ms: 0.0,
             slack_ms: 0.0,
+            sync_var: 0.0,
             _pad: [0.0; 5],
         }
     }
@@ -97,6 +99,7 @@ impl ShaderUniforms {
         sync_score: f32,
         cpu_time_ms: f32,
         slack_ms: f32,
+        sync_var: f32,
     ) -> Self {
         Self {
             color: [args.red, args.green, args.blue, 1.0],
@@ -113,6 +116,7 @@ impl ShaderUniforms {
             sync_score,
             cpu_time_ms,
             slack_ms,
+            sync_var,
             _pad: [0.0; 5],
         }
     }

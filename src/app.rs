@@ -47,7 +47,8 @@ impl<'a> ApplicationHandler for App<'a> {
             GPU:  GPU render time (ms)\n\
             SYN:  Vblank alignment sync score (0-100)\n\
             SLA:  Slack (ms)\n\
-            =============="
+            SVA:  Sync score standard deviation\n\
+            ==============\n"
         );
     }
 

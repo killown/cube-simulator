@@ -4,6 +4,7 @@ use std::io::Write;
 
 pub struct FrameMetrics {
     pub frame_times: VecDeque<f32>,
+    pub sync_scores: VecDeque<f32>,
     pub frame_budget_ms: f32,
     pub frame_count: u32,
     pub dropped_frames: u32,
@@ -27,6 +28,7 @@ pub struct TickStats {
     pub jitter: f32,
     pub dropped_frames: u32,
     pub ftv: f32,
+    pub sync_var: f32,
     /// `true` when jitter/ftv are derived from KMS flip timestamps rather than
     /// CPU-side `Instant` deltas. When `false`, `max_render_time` on a Mailbox
     /// compositor can artificially deflate these values.
@@ -391,6 +393,7 @@ impl FrameMetrics {
         let ring_cap = ((30_000.0 / frame_budget_ms).ceil() as usize).max(256);
         Self {
             frame_times: VecDeque::with_capacity(ring_cap),
+            sync_scores: VecDeque::with_capacity(ring_cap),
             frame_budget_ms,
             frame_count: 0,
             dropped_frames: 0,
@@ -455,6 +458,26 @@ impl FrameMetrics {
         Some(stats)
     }
 
+    pub fn calculate_sync_var(&self) -> f32 {
+        let n = self.sync_scores.len();
+        if n < 2 {
+            return 0.0;
+        }
+
+        let mean = self.sync_scores.iter().sum::<f32>() / n as f32;
+        let variance = self
+            .sync_scores
+            .iter()
+            .map(|&s| {
+                let diff = s - mean;
+                diff * diff
+            })
+            .sum::<f32>()
+            / n as f32;
+
+        variance.sqrt()
+    }
+
     fn compute_tick(&mut self, elapsed_secs: f32) -> TickStats {
         self.current_fps = self.frame_count as f32 / elapsed_secs;
 
@@ -500,6 +523,7 @@ impl FrameMetrics {
             jitter,
             dropped_frames: self.dropped_frames,
             ftv,
+            sync_var: self.calculate_sync_var(),
             hw_verified,
         }
     }
