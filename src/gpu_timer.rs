@@ -3,6 +3,29 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
+/// Returns `CLOCK_MONOTONIC` nanoseconds via direct libc syscall.
+///
+/// Same implementation as `renderer::clock_monotonic_ns`, duplicated here so
+/// `GpuTimer::poll` does not need to cross a module boundary for a single read.
+/// Falls back to `0` on non-Linux targets; callers treat `0` as `None`.
+#[cfg(target_os = "linux")]
+#[inline]
+fn clock_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `CLOCK_MONOTONIC` (1) is always present on Linux, `ts` is
+    // zero-initialised before the kernel writes into it.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn clock_monotonic_ns() -> u64 {
+    0
+}
+
 /// Number of timestamp slots for the outer render-pass timer (begin + end).
 const QUERY_COUNT: u32 = 2;
 
@@ -90,6 +113,14 @@ struct GpuTimerInner {
     readback_buf: wgpu::Buffer,
     state: Arc<AtomicU8>,
     pub last_gpu_time_ms: Option<f32>,
+    /// `CLOCK_MONOTONIC` nanoseconds captured on the render thread immediately
+    /// after the readback buffer transitions from `Pending → Mapped`.
+    ///
+    /// Because the GPU has finished executing the render pass by the time the
+    /// map callback fires, this timestamp upper-bounds `gpu_end` with only PCIe
+    /// readback delivery lag (< 0.5 ms on modern hardware).  Used by the flip
+    /// tracker to compute `flip_latency_ms = flip_ns − gpu_end_ns`.
+    pub last_poll_ns: Option<u64>,
 
     // ── Micro-stutter diagnostic timer (optional) ────────────────────────────
     /// `None` when `TIMESTAMP_QUERY_INSIDE_ENCODERS` is absent.
@@ -196,6 +227,7 @@ impl GpuTimer {
                 readback_buf,
                 state: Arc::new(AtomicU8::new(STATE_IDLE)),
                 last_gpu_time_ms: None,
+                last_poll_ns: None,
                 micro,
                 timestamp_period_ns,
             }),
@@ -354,6 +386,10 @@ impl GpuTimer {
             };
             inner.readback_buf.unmap();
             inner.state.store(STATE_IDLE, Ordering::Relaxed);
+            // Snapshot CLOCK_MONOTONIC immediately after unmap.  The GPU finished
+            // executing before the map callback fired, so this over-estimates
+            // gpu_end by only the PCIe readback delivery lag (< 0.5 ms typical).
+            inner.last_poll_ns = Some(clock_monotonic_ns());
             if let Some(t) = gpu_ms {
                 inner.last_gpu_time_ms = Some(t);
             }
@@ -429,5 +465,22 @@ impl GpuTimer {
             .as_ref()
             .and_then(|i| i.micro.as_ref())
             .and_then(|m| m.last_timings)
+    }
+
+    /// `CLOCK_MONOTONIC` nanoseconds captured when the most recent outer-timer
+    /// readback was consumed by [`GpuTimer::poll`].
+    ///
+    /// Because the GPU has finished the render pass before the `map_async`
+    /// callback can fire, this value upper-bounds the true `gpu_end` timestamp
+    /// with only PCIe readback delivery lag (< 0.5 ms on modern discrete GPUs).
+    ///
+    /// Used by the flip tracker to compute:
+    /// `flip_latency_ms = (flip_ns − gpu_end_ns) / 1_000_000`
+    ///
+    /// Returns `None` until the first readback completes or permanently when
+    /// `TIMESTAMP_QUERY` is unavailable.
+    #[inline]
+    pub fn last_gpu_end_ns(&self) -> Option<u64> {
+        self.inner.as_ref().and_then(|i| i.last_poll_ns)
     }
 }

@@ -179,11 +179,34 @@ pub struct FramePacingRecord {
     /// The full elapsed time between `MICRO_SLOT_SUBMIT_PRE` and
     /// `MICRO_SLOT_RESOLVE_END` on the GPU clock.  Equals
     /// `micro_driver_ms + gpu_time_ms + micro_resolve_ms` when all three are
-    /// available.  Use this as a single "how long did the GPU spend on this
+    /// available.  Use as a single "how long did the GPU spend on this
     /// frame end-to-end" number for quick triage.
     ///
     /// `None` when `TIMESTAMP_QUERY_INSIDE_ENCODERS` is unavailable.
     pub micro_total_ms: Option<f32>,
+
+    // ── Late-Stage Presentation Tracking ─────────────────────────────────────
+    /// Time from GPU render-pass end (`gpu_time_ms` stop) to actual KMS scanout
+    /// start, as reported by the kernel's `DRM_EVENT_FLIP_COMPLETE` interrupt
+    /// (milliseconds, CLOCK_MONOTONIC domain).
+    ///
+    /// This is the **compositor scheduling tax**: the wall-clock time the finished
+    /// frame spent waiting in the compositor's buffer queue before the kernel
+    /// actually drove it to the display.
+    ///
+    /// Interpretation:
+    /// - `< 1 ms`           → compositor scanned out immediately, no hold.
+    /// - `1–8 ms`           → normal compositor compositing overhead (one pass).
+    /// - `> (ideal_ms / 2)` → compositor is holding a completed frame across a
+    ///                         vblank boundary, the "lie" this tool detects.
+    ///                         Cross-reference `slack_ms`: if `slack_ms` is large
+    ///                         but `gpu_time_ms < ideal_ms`, the GPU is not the
+    ///                         bottleneck, the compositor is.
+    ///
+    /// Requires an active [`crate::flip_tracker::FlipTracker`] and `TIMESTAMP_QUERY`
+    /// support.  `None` when either is unavailable or when the flip event for this
+    /// frame has not yet been delivered by the kernel.
+    pub flip_latency_ms: Option<f32>,
 }
 
 /// Stateful per-frame pacing analyzer driven by hardware presentation timestamps.
@@ -253,6 +276,10 @@ impl PacingAnalyzer {
     ///   query set (`TIMESTAMP_QUERY_INSIDE_ENCODERS`).  `None` when the feature is
     ///   unavailable.  When present, `driver_overhead_ms`, `resolve_ms`, and
     ///   `total_ms` are logged to the frame log alongside `gpu_time_ms`.
+    /// * `flip_latency_ms` Compositor scheduling tax derived from the KMS
+    ///   `DRM_EVENT_FLIP_COMPLETE` interrupt timestamp minus the GPU render-pass end
+    ///   timestamp.  `None` when [`crate::flip_tracker::FlipTracker`] is inactive or
+    ///   no flip event has been drained for this frame yet.
     pub fn push(
         &mut self,
         ts_ns: u64,
@@ -260,6 +287,7 @@ impl PacingAnalyzer {
         cpu_submit_ns: Option<u64>,
         gpu_time_ms: Option<f32>,
         micro: Option<crate::gpu_timer::MicroTimings>,
+        flip_latency_ms: Option<f32>,
     ) -> Option<FramePacingRecord> {
         let idx = self.frame_index;
         self.frame_index += 1;
@@ -347,6 +375,7 @@ impl PacingAnalyzer {
             micro_driver_ms: micro.map(|m| m.driver_overhead_ms),
             micro_resolve_ms: micro.map(|m| m.resolve_ms),
             micro_total_ms: micro.map(|m| m.total_ms),
+            flip_latency_ms,
         })
     }
 }
@@ -608,32 +637,33 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// into how each individual frame landed relative to the ideal vblank grid.
 ///
 /// # Fields emitted
-/// - `schema`          — version tag; increment when the field set changes
-/// - `frame`           — monotonic frame index since session start
-/// - `cube_count`      — cube count active during this frame
-/// - `ts_ns`           — raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
-/// - `delta_ms`        — measured inter-frame interval on the presentation clock
-/// - `ideal_ms`        — target vblank period from monitor refresh rate
-/// - `drift_ms`        — signed deviation from nearest vblank boundary (+ = late, − = early)
-/// - `drift_ns`        — same drift at nanosecond precision (for PLL / repaint-timer use)
-/// - `vblank_mul`      — vblank periods consumed (1 = on-time, 2 = one dropped, ≥3 = stall)
-/// - `sync`            — 0–100 quality score (100 = perfectly on-vblank)
-/// - `ipc_delta_ms`    — instantaneous Δ between this and the previous `delta_ms`
-/// - `cpu_frame_ms`    — CPU-observed total frame time
-/// - `slack_ms`        — `present_ts − submit_cpu`: GPU execution + flip pipeline depth
-/// - `gpu_time_ms`     — true GPU render-pass execution time from hardware timestamp queries
-/// - `micro_driver_ms` — Vulkan driver command-buffer submission latency (encoder bracket)
-/// - `micro_resolve_ms`— GPU DMA + PCIe copy overhead for timestamp readback resolve
-/// - `micro_total_ms`  — full GPU pipeline span: driver + shader + resolve combined
+/// - `schema`           — version tag, increment when the field set changes
+/// - `frame`            — monotonic frame index since session start
+/// - `cube_count`       — cube count active during this frame
+/// - `ts_ns`            — raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
+/// - `delta_ms`         — measured inter-frame interval on the presentation clock
+/// - `ideal_ms`         — target vblank period from monitor refresh rate
+/// - `drift_ms`         — signed deviation from nearest vblank boundary (+ = late, − = early)
+/// - `drift_ns`         — same drift at nanosecond precision (for PLL / repaint-timer use)
+/// - `vblank_mul`       — vblank periods consumed (1 = on-time, 2 = one dropped, ≥3 = stall)
+/// - `sync`             — 0–100 quality score (100 = perfectly on-vblank)
+/// - `ipc_delta_ms`     — instantaneous Δ between this and the previous `delta_ms`
+/// - `cpu_frame_ms`     — CPU-observed total frame time
+/// - `slack_ms`         — `present_ts − submit_cpu`: GPU execution + flip pipeline depth
+/// - `gpu_time_ms`      — true GPU render-pass execution time from hardware timestamp queries
+/// - `micro_driver_ms`  — Vulkan driver command-buffer submission latency (encoder bracket)
+/// - `micro_resolve_ms` — GPU DMA + PCIe copy overhead for timestamp readback resolve
+/// - `micro_total_ms`   — full GPU pipeline span: driver + shader + resolve combined
+/// - `flip_latency_ms`  — compositor scheduling tax: GPU end → KMS scanout start
 ///
 /// Optional fields are omitted from the JSON object entirely when `None`.
 pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord, cube_count: u32) {
     let Some(f) = file else { return };
 
-    // schema:3 adds micro_driver_ms, micro_resolve_ms, micro_total_ms fields.
+    // schema:4 adds flip_latency_ms field.
     let _ = write!(
         f,
-        r#"{{"schema":3,"frame":{},"cube_count":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
+        r#"{{"schema":4,"frame":{},"cube_count":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
         record.frame_index,
         cube_count,
         record.timestamp_ns,
@@ -666,6 +696,9 @@ pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord, 
     }
     if let Some(v) = record.micro_total_ms {
         let _ = write!(f, r#","micro_total_ms":{:.4}"#, v);
+    }
+    if let Some(v) = record.flip_latency_ms {
+        let _ = write!(f, r#","flip_latency_ms":{:.4}"#, v);
     }
 
     let _ = writeln!(f, "}}");

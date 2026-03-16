@@ -6,6 +6,7 @@ use winit::window::Window;
 
 use crate::args::Args;
 use crate::benchmark::BenchmarkState;
+use crate::flip_tracker::FlipTracker;
 use crate::gpu_tier::GpuTier;
 use crate::gpu_timer::GpuTimer;
 use crate::metrics::{
@@ -75,6 +76,21 @@ pub struct State<'a> {
     /// Last printed `raw_vblank_mul`; suppresses duplicate `[MICRO]` lines when
     /// two consecutive WSI deltas both reflect the same overrun event.
     last_micro_vblank_mul: u32,
+    /// Async DRM page-flip tracker, `None` when DRM is unavailable or the CRTC
+    /// handle could not be resolved.  When present, drains `FlipRecord`s each
+    /// frame to compute `flip_latency_ms = flip_ns − gpu_end_ns`.
+    flip_tracker: Option<FlipTracker>,
+    /// `CLOCK_MONOTONIC` nanoseconds at the moment the GPU render pass ended,
+    /// derived from the resolved `TIMESTAMP_QUERY` end slot.  Stored one frame
+    /// behind (matching the async readback pipeline depth) so it aligns with the
+    /// `DRM_EVENT_FLIP_COMPLETE` timestamp for that same submit.
+    ///
+    /// `None` until the first outer timer readback completes or when
+    /// `TIMESTAMP_QUERY` is unavailable.
+    gpu_end_ns: Option<u64>,
+    /// Set to `true` the first time `flip_tracker.healthy` transitions to `false`,
+    /// so the warning is logged exactly once rather than every frame.
+    flip_tracker_warned: bool,
 }
 
 /// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
@@ -216,7 +232,7 @@ impl<'a> State<'a> {
             println!("GPU timestamps:          available (TIMESTAMP_QUERY, hardware-accurate)");
         } else {
             eprintln!(
-                "WARN: TIMESTAMP_QUERY not supported; gpu_time_ms absent from frame logs. \
+                "WARN: TIMESTAMP_QUERY not supported, gpu_time_ms absent from frame logs. \
                  Cannot distinguish GPU budget overrun from compositor buffer-hold."
             );
         }
@@ -368,6 +384,21 @@ impl<'a> State<'a> {
             cache: None,
         });
 
+        let flip_tracker = drm_info.as_ref().and_then(|info| {
+            let crtc = info.primary_crtc?;
+            let tracker = FlipTracker::new(&info.dev_path, crtc);
+            if tracker.is_some() {
+                println!(
+                    "Flip tracker:            active  (DRM_EVENT_FLIP_COMPLETE, CLOCK_MONOTONIC)"
+                );
+            } else {
+                eprintln!(
+                    "WARN: DRM flip tracker could not start, flip_latency_ms will be absent from logs."
+                );
+            }
+            tracker
+        });
+
         let benchmark = args
             .bench_secs
             .map(|secs| BenchmarkState::new(secs, args.bench_warmup, args.bench_max));
@@ -401,6 +432,9 @@ impl<'a> State<'a> {
             gpu_timer,
             gpu_tier,
             last_micro_vblank_mul: 0,
+            flip_tracker,
+            gpu_end_ns: None,
+            flip_tracker_warned: false,
         }
     }
 
@@ -450,6 +484,45 @@ impl<'a> State<'a> {
         self.gpu_timer.poll();
         let gpu_time_ms = self.gpu_timer.last_gpu_time_ms();
         let micro = self.gpu_timer.last_micro_timings();
+
+        // Update gpu_end_ns from the readback timestamp captured inside poll().
+        // This is used one frame later by the flip tracker to compute
+        // flip_latency_ms = flip_ns − gpu_end_ns.
+        if let Some(ns) = self.gpu_timer.last_gpu_end_ns() {
+            self.gpu_end_ns = Some(ns);
+        }
+
+        // Warn once if the flip thread exited (compositor restart, TTY switch).
+        if self
+            .flip_tracker
+            .as_ref()
+            .is_some_and(|ft| !ft.healthy.load(std::sync::atomic::Ordering::Acquire))
+            && !self.flip_tracker_warned
+        {
+            eprintln!(
+                "WARN: DRM flip tracker thread exited; flip_latency_ms suspended. \
+         Likely cause: compositor restart or TTY switch."
+            );
+            self.flip_tracker_warned = true;
+        }
+
+        // Drain the most recent flip event and derive compositor scheduling tax.
+        // `flip_ns − gpu_end_ns` is the time the finished frame spent waiting in
+        // the compositor's buffer queue before the kernel drove it to the display.
+        // Clamp to [0, 2 × ideal_ms] to discard stale events from pipeline flushes.
+        let flip_latency_ms: Option<f32> = self
+            .flip_tracker
+            .as_ref()
+            .filter(|ft| ft.healthy.load(std::sync::atomic::Ordering::Acquire))
+            .and_then(|ft| ft.queue.lock().ok())
+            .and_then(|mut q| q.pop_front())
+            .zip(self.gpu_end_ns)
+            .and_then(|(record, gpu_end)| {
+                let latency_ns = record.flip_ns.saturating_sub(gpu_end);
+                let latency_ms = latency_ns as f32 / 1_000_000.0;
+                let ceiling_ms = self.metrics.frame_budget_ms * 2.0;
+                (latency_ms >= 0.0 && latency_ms < ceiling_ms).then_some(latency_ms)
+            });
 
         // Write time in one upload before acquire.
         self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
@@ -613,6 +686,7 @@ impl<'a> State<'a> {
                     Some(cpu_submit_ns),
                     gpu_time_ms,
                     micro,
+                    flip_latency_ms,
                 );
 
                 if let Some(record) = &pacing_record {

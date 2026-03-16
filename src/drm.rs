@@ -36,6 +36,19 @@ pub struct ConnectorInfo {
 #[derive(Clone)]
 pub struct DrmInfo {
     pub connectors: Vec<ConnectorInfo>,
+    /// Raw CRTC handle for the first active connector found during `query()`.
+    ///
+    /// Passed into [`crate::flip_tracker::FlipTracker::new`] so the page-flip
+    /// epoll loop can register for `DRM_EVENT_FLIP_COMPLETE` on the correct CRTC
+    /// without re-querying DRM topology at tracker-start time.
+    ///
+    /// `None` when no active CRTC was found (e.g. headless, all connectors inactive).
+    pub primary_crtc: Option<u32>,
+    /// Device node path used to open the fd that produced this snapshot.
+    ///
+    /// Stored so `FlipTracker::new` can open a fresh, independent fd for the
+    /// epoll thread without any fd-lifetime dependency on the query-time `Card`.
+    pub dev_path: String,
 }
 
 impl DrmInfo {
@@ -71,17 +84,24 @@ impl DrmInfo {
 /// Tries `/dev/dri/card0` through `card9` in order, returning `None` if no
 /// node can be opened or the DRM ioctls fail. Non-fatal — the caller should
 /// degrade gracefully and continue without DRM info.
+///
+/// The `primary_crtc` field in the returned [`DrmInfo`] is populated with the
+/// raw CRTC handle of the first active connector found, enabling the caller to
+/// construct a [`crate::flip_tracker::FlipTracker`] without a second DRM query.
 pub fn query() -> Option<DrmInfo> {
-    let card = (0..10).find_map(|i| {
+    let (card, dev_path) = (0..10).find_map(|i| {
+        let path = format!("/dev/dri/card{}", i);
         OpenOptions::new()
             .read(true)
             .write(true)
-            .open(format!("/dev/dri/card{}", i))
+            .open(&path)
             .ok()
-            .map(Card)
+            .map(|f| (Card(f), path))
     })?;
 
     let res = card.resource_handles().ok()?;
+
+    let mut primary_crtc: Option<u32> = None;
 
     let connectors = res
         .connectors()
@@ -90,11 +110,9 @@ pub fn query() -> Option<DrmInfo> {
             let info = card.get_connector(handle, true).ok()?;
             let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
 
-            let crtc_id = info.current_encoder().and_then(|enc_handle| {
-                card.get_encoder(enc_handle)
-                    .ok()
-                    .and_then(|enc| enc.crtc().map(|h| u32::from(h)))
-            });
+            let crtc_id = info
+                .current_encoder()
+                .and_then(|enc_handle| card.get_encoder(enc_handle).ok()?.crtc().map(u32::from));
 
             let active_mode: Option<ActiveMode> = crtc_id.and_then(|id| {
                 res.crtcs()
@@ -110,6 +128,10 @@ pub fn query() -> Option<DrmInfo> {
                     })
             });
 
+            // Record the first active CRTC handle for `FlipTracker`.
+            if active_mode.is_some() && primary_crtc.is_none() {
+                primary_crtc = crtc_id;
+            }
             let vrr_enabled: Option<bool> = crtc_id.and_then(|id| {
                 res.crtcs()
                     .iter()
@@ -137,5 +159,9 @@ pub fn query() -> Option<DrmInfo> {
         })
         .collect();
 
-    Some(DrmInfo { connectors })
+    Some(DrmInfo {
+        connectors,
+        primary_crtc,
+        dev_path,
+    })
 }

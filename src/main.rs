@@ -2,6 +2,7 @@ mod app;
 mod args;
 mod benchmark;
 mod drm;
+mod flip_tracker;
 mod gpu_tier;
 mod gpu_timer;
 mod metrics;
