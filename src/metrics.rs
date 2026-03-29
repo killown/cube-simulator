@@ -232,6 +232,32 @@ pub struct PacingAnalyzer {
     prev_cpu_submit_ns: Option<u64>,
     /// Monotonically increasing frame counter.
     frame_index: u64,
+    /// `phase_drift_ns` from the most recently completed [`push`](Self::push) call.
+    ///
+    /// Stored so [`crate::renderer::State`] can feed the PLL controller with the
+    /// previous frame's phase error at the top of the *next* frame, before the
+    /// current frame's presentation timestamp has been sampled.  `None` until the
+    /// first valid pacing record is produced.
+    last_phase_drift_ns: Option<i64>,
+    /// `vblank_mul` from the most recently completed [`push`](Self::push) call.
+    ///
+    /// Passed to [`crate::pll::PllController::compute_deadline`] so the grid is
+    /// advanced by the correct number of periods when a frame was dropped.
+    /// Defaults to `1` until the first valid record is produced.
+    last_vblank_mul: u32,
+    /// Absolute `CLOCK_MONOTONIC` nanoseconds of a confirmed hardware vblank edge,
+    /// derived from the first `DRM_EVENT_FLIP_COMPLETE` timestamp delivered by
+    /// [`crate::flip_tracker::FlipTracker`].
+    ///
+    /// When `Some`, this replaces the floating WSI timestamp as `phase_origin_ns`,
+    /// anchoring the ideal vblank grid to the actual hardware scanout clock.
+    /// `sync_score` and `phase_drift_ns` are then absolute: drift = 0 means the
+    /// frame landed exactly on a real hardware vblank edge.
+    ///
+    /// `None` until the first flip event arrives.  Never overwritten once set
+    /// (all flip events share the same epoch); cleared on discontinuity so a
+    /// compositor restart re-anchors cleanly.
+    hw_vblank_anchor_ns: Option<u64>,
 }
 
 impl PacingAnalyzer {
@@ -248,6 +274,9 @@ impl PacingAnalyzer {
             prev_delta_ms: None,
             prev_cpu_submit_ns: None,
             frame_index: 0,
+            last_phase_drift_ns: None,
+            last_vblank_mul: 1,
+            hw_vblank_anchor_ns: None,
         }
     }
 
@@ -262,29 +291,22 @@ impl PacingAnalyzer {
     /// and produce phantom drift on every subsequent frame.
     ///
     /// # Arguments
-    /// * `ts_ns` Raw KMS/WSI nanosecond timestamp from
+    /// * `ts_ns`, Raw KMS/WSI nanosecond timestamp from
     ///   `adapter.get_presentation_timestamp()`.  Must be CLOCK_MONOTONIC domain.
-    /// * `cpu_frame_ms`, CPU-observed total frame time (`RedrawRequested` →
-    ///   `present()` return), in milliseconds.  `None` if not measured.
-    /// * `cpu_submit_ns`, `std::time::Instant` converted to nanoseconds, sampled
-    ///   immediately after `queue.submit()` returns for **this** frame.  Stored and
-    ///   matched against the **next** frame's `ts_ns` to derive `slack_ms`, because
-    ///   the hardware presentation timestamp for a given submit arrives one frame later.
-    ///   `None` if not measured.
-    /// * `gpu_time_ms` True GPU execution time from a resolved `TIMESTAMP_QUERY`
-    ///   `QuerySet`, in milliseconds.  `None` when the feature is unavailable or the
-    ///   readback buffer has not yet been mapped.
-    /// * `micro` Decomposed GPU pipeline timings from the micro-stutter diagnostic
-    ///   query set (`TIMESTAMP_QUERY_INSIDE_ENCODERS`).  `None` when the feature is
-    ///   unavailable.  When present, `driver_overhead_ms`, `resolve_ms`, and
-    ///   `total_ms` are logged to the frame log alongside `gpu_time_ms`.
-    /// * `flip_latency_ms` Compositor scheduling tax derived from the KMS
-    ///   `DRM_EVENT_FLIP_COMPLETE` interrupt timestamp minus the GPU render-pass end
-    ///   timestamp.  `None` when [`crate::flip_tracker::FlipTracker`] is inactive or
-    ///   no flip event has been drained for this frame yet.
+    /// * `hw_vblank_ns`, `CLOCK_MONOTONIC` timestamp of the hardware vblank edge
+    ///   from `DRM_EVENT_FLIP_COMPLETE`, if one was delivered this frame.  When
+    ///   `Some`, the phase grid is anchored to the real scanout clock so
+    ///   `sync_score` and `phase_drift_ns` are absolute: drift = 0 means the
+    ///   frame presented on an actual hardware vblank edge.
+    /// * `cpu_frame_ms`, CPU-observed total frame time, in milliseconds.
+    /// * `cpu_submit_ns`, Sampled immediately after `queue.submit()` returns.
+    /// * `gpu_time_ms`, True GPU execution time from a resolved `TIMESTAMP_QUERY`.
+    /// * `micro`, Decomposed GPU pipeline timings from the micro-stutter diagnostic.
+    /// * `flip_latency_ms`, Compositor scheduling tax from `DRM_EVENT_FLIP_COMPLETE`.
     pub fn push(
         &mut self,
         ts_ns: u64,
+        hw_vblank_ns: Option<u64>,
         cpu_frame_ms: Option<f32>,
         cpu_submit_ns: Option<u64>,
         gpu_time_ms: Option<f32>,
@@ -301,6 +323,7 @@ impl PacingAnalyzer {
 
         if delta_ms <= 0.0 || delta_ms >= 1000.0 {
             self.phase_origin_ns = None;
+            self.hw_vblank_anchor_ns = None;
             self.prev_delta_ms = None;
             self.prev_cpu_submit_ns = cpu_submit_ns;
             return None;
@@ -314,17 +337,58 @@ impl PacingAnalyzer {
         // yet the origin stays pinned to the pre-gap timestamp.
         if delta_ms > ideal_ms * 3.0 {
             self.phase_origin_ns = None;
+            self.hw_vblank_anchor_ns = None;
         }
 
-        let origin = *self.phase_origin_ns.get_or_insert(ts_ns);
+        // Accept the first hardware vblank anchor from DRM_EVENT_FLIP_COMPLETE.
+        // All flip events share the same CLOCK_MONOTONIC epoch, so one anchor is
+        // sufficient for the lifetime of the session.
+        if let Some(flip_ns) = hw_vblank_ns {
+            if self.hw_vblank_anchor_ns.is_none() {
+                self.hw_vblank_anchor_ns = Some(flip_ns);
+                // Discard the floating WSI origin so it is recomputed from the
+                // hardware anchor on this iteration.
+                self.phase_origin_ns = None;
+            }
+        }
 
-        // Distance of this timestamp from the phase origin in vblank periods.
-        let elapsed_ns = ts_ns.saturating_sub(origin);
-        let nearest_vblank_count = (elapsed_ns as f64 / self.ideal_period_ns as f64).round() as u64;
-        let ideal_ts_ns = origin + nearest_vblank_count * self.ideal_period_ns;
+        // Build the ideal vblank grid anchored to hardware when possible.
+        //
+        // With a hardware anchor: origin = the hardware vblank immediately before
+        // `ts_ns`, snapped by integer division so the grid is in absolute phase.
+        // Drift = 0 means the WSI timestamp landed exactly on a hardware vblank edge.
+        //
+        // Without a hardware anchor: origin = the WSI timestamp of the first frame,
+        // a floating origin.  Drift is consistent (relative) but not absolute —
+        // the zero point is wherever the first frame happened to land.
+        let origin = match self.hw_vblank_anchor_ns {
+            Some(anchor) => {
+                let elapsed = ts_ns.saturating_sub(anchor);
+                let vblank_count = elapsed / self.ideal_period_ns;
+                *self
+                    .phase_origin_ns
+                    .get_or_insert(anchor + vblank_count * self.ideal_period_ns)
+            }
+            None => *self.phase_origin_ns.get_or_insert(ts_ns),
+        };
 
-        // Signed drift: positive = late, negative = early.
-        let drift_ns = ts_ns as i64 - ideal_ts_ns as i64;
+        // Signed distance of ts_ns from the nearest ideal vblank on the anchored grid.
+        //
+        // With a hardware anchor, `origin` is the vblank edge immediately before
+        // `ts_ns`, so `ts_ns - origin` is always in [0, ideal_period_ns).  The
+        // nearest boundary is either `origin` itself (if ts_ns is in the first half
+        // of the period) or `origin + ideal_period_ns` (second half).
+        //
+        // Without a hardware anchor the same arithmetic applies but the zero point
+        // of the grid is the floating first-frame WSI timestamp, consistent but
+        // not absolute.
+        let elapsed_from_origin = ts_ns as i64 - origin as i64;
+        let period = self.ideal_period_ns as f64;
+        let nearest_count = (elapsed_from_origin as f64 / period).round() as i64;
+        let ideal_ts_ns = origin as i64 + nearest_count * self.ideal_period_ns as i64;
+
+        // Signed drift: positive = late (after the vblank edge), negative = early.
+        let drift_ns = ts_ns as i64 - ideal_ts_ns;
         let drift_ms = drift_ns as f32 / 1_000_000.0;
 
         let half_period_ms = ideal_ms / 2.0;
@@ -360,6 +424,8 @@ impl PacingAnalyzer {
 
         self.prev_delta_ms = Some(delta_ms);
         self.prev_cpu_submit_ns = cpu_submit_ns;
+        self.last_phase_drift_ns = Some(drift_ns);
+        self.last_vblank_mul = vblank_mul;
 
         Some(FramePacingRecord {
             frame_index: idx,
@@ -379,6 +445,27 @@ impl PacingAnalyzer {
             micro_total_ms: micro.map(|m| m.total_ms),
             flip_latency_ms,
         })
+    }
+
+    /// Returns the `phase_drift_ns` from the most recently completed [`push`] call.
+    ///
+    /// `None` until the first valid pacing record is produced (second frame or
+    /// later, after a clock discontinuity, or before any HW timestamps arrive).
+    /// Used by the PLL controller to read the previous frame's phase error at the
+    /// top of the next frame, before the current frame's timestamp is available.
+    #[inline]
+    pub fn last_phase_drift_ns(&self) -> Option<i64> {
+        self.last_phase_drift_ns
+    }
+
+    /// Returns the `vblank_mul` from the most recently completed [`push`] call.
+    ///
+    /// Defaults to `1` until the first valid record is produced.  Passed to
+    /// [`crate::pll::PllController::compute_deadline`] so the vblank grid is
+    /// advanced by the correct number of periods when the previous frame was dropped.
+    #[inline]
+    pub fn last_vblank_mul(&self) -> u32 {
+        self.last_vblank_mul
     }
 }
 
@@ -679,15 +766,25 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// - `micro_resolve_ms` — GPU DMA + PCIe copy overhead for timestamp readback resolve
 /// - `micro_total_ms`   — full GPU pipeline span: driver + shader + resolve combined
 /// - `flip_latency_ms`  — compositor scheduling tax: GPU end → KMS scanout start
+/// - `pll_error_ns`     — phase error fed into the PLL PI controller this frame (signed ns)
+/// - `pll_sleep_ns`     — sleep duration issued by the PLL before `get_current_texture()`
+/// - `pll_deadline_ns`  — absolute CLOCK_MONOTONIC deadline the PLL slept until
+/// - `pll_budget_ns`    — render budget EMA used to compute the deadline
+/// - `pll_lock`         — `1` when the PLL is in Locked (tracking) mode, `0` while acquiring
 ///
 /// Optional fields are omitted from the JSON object entirely when `None`.
-pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord, cube_count: u32) {
+pub fn write_frame_log_row(
+    file: &mut Option<File>,
+    record: &FramePacingRecord,
+    cube_count: u32,
+    pll: Option<&crate::pll::PllDiagnostics>,
+) {
     let Some(f) = file else { return };
 
-    // schema:4 adds flip_latency_ms field.
+    // schema:5 adds pll_error_ns, pll_sleep_ns, pll_lock fields.
     let _ = write!(
         f,
-        r#"{{"schema":4,"frame":{},"cube_count":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
+        r#"{{"schema":5,"frame":{},"cube_count":{},"ts_ns":{},"delta_ms":{:.4},"ideal_ms":{:.4},"drift_ms":{:.4},"drift_ns":{},"vblank_mul":{},"sync":{:.2}"#,
         record.frame_index,
         cube_count,
         record.timestamp_ns,
@@ -723,6 +820,21 @@ pub fn write_frame_log_row(file: &mut Option<File>, record: &FramePacingRecord, 
     }
     if let Some(v) = record.flip_latency_ms {
         let _ = write!(f, r#","flip_latency_ms":{:.4}"#, v);
+    }
+    if let Some(p) = pll {
+        let _ = write!(
+            f,
+            r#","pll_error_ns":{},"pll_sleep_ns":{},"pll_deadline_ns":{},"pll_budget_ns":{},"pll_lock":{}"#,
+            p.phase_error_ns,
+            p.sleep_ns,
+            p.deadline_ns,
+            p.render_budget_ns,
+            if p.lock_state == crate::pll::PllLockState::Locked {
+                1
+            } else {
+                0
+            },
+        );
     }
 
     let _ = writeln!(f, "}}");

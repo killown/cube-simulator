@@ -12,6 +12,7 @@ use crate::gpu_timer::GpuTimer;
 use crate::metrics::{
     FrameMetrics, PacingAnalyzer, write_csv_row, write_frame_log_row, write_json_row,
 };
+use crate::pll::{PllController, PllDiagnostics};
 use crate::uniforms::{ShaderUniforms, UniformBinding};
 
 /// Full GPU rendering state for one window.
@@ -93,6 +94,25 @@ pub struct State<'a> {
     flip_tracker_warned: bool,
     /// Last measured slack_ms (time from submit to presentation).
     slack_ms: f32,
+    /// CPU frame time from the previous frame (milliseconds).
+    ///
+    /// Stored one frame behind so the PLL controller can use it as a render
+    /// budget fallback when `TIMESTAMP_QUERY` is unavailable.  The current
+    /// frame's `cpu_frame_ms` is not available until after `present()` returns,
+    /// which is after the PLL sleep that needs the estimate.
+    prev_cpu_frame_ms: f32,
+    /// Software PLL controller for vblank-synchronised frame submission.
+    ///
+    /// `None` when `--pll` was not passed. When `Some`, [`PllController::compute_deadline`]
+    /// is called every frame immediately before `get_current_texture()`, and the
+    /// returned absolute deadline is issued via `clock_nanosleep(TIMER_ABSTIME)` so
+    /// the GPU submit is rate-limited to the monitor refresh rate and phase-aligned
+    /// to the nearest ideal vblank boundary.
+    pll: Option<PllController>,
+    /// Most recent PLL diagnostic from this frame's [`PllController::compute_deadline`]
+    /// call.  `None` when `--pll` is inactive.  Stored so [`write_frame_log_row`]
+    /// can emit the pll fields without borrowing the controller mid-frame.
+    pll_diag: Option<PllDiagnostics>,
 }
 
 /// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
@@ -153,6 +173,10 @@ impl<'a> State<'a> {
                     .map(|mhz| 1_000_000.0 / mhz as f32)
             })
             .unwrap_or(1000.0 / 60.0);
+
+        // Used to seed `prev_cpu_frame_ms` to a reasonable non-zero value before
+        // the first real frame measurement is available.
+        let ideal_period_ns_init = frame_budget_ms as f64 * 1_000_000.0;
 
         println!(
             "Frame Budget: {:.4}ms ({:.2}Hz)  ",
@@ -319,7 +343,7 @@ impl<'a> State<'a> {
                 .append(true)
                 .open(path)
                 .unwrap();
-            let _ = writeln!(f, "# schema:2 frame,cube_count,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms][,gpu_time_ms]");
+            let _ = writeln!(f, "# schema:2 frame,cube_count,ts_ns,delta_ms,ideal_ms,drift_ms,drift_ns,vblank_mul,sync[,ipc_delta_ms][,cpu_frame_ms][,slack_ms][,gpu_time_ms][,pll_error_ns][,pll_sleep_ns][,pll_deadline_ns][,pll_budget_ns][,pll_lock]");
             Some(f)
         });
 
@@ -405,6 +429,29 @@ impl<'a> State<'a> {
             .bench_secs
             .map(|secs| BenchmarkState::new(secs, args.bench_warmup, args.bench_max));
 
+        let pll = if args.pll {
+            let ctrl = PllController::new(frame_budget_ms);
+            println!(
+                "PLL scheduler:           active  \
+                 (PI controller, clock_nanosleep TIMER_ABSTIME)"
+            );
+            if args
+                .mode
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("fifo"))
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "WARN: --pll with --mode fifo has limited effect; \
+                     the driver absorbs the vblank wait inside get_current_texture(). \
+                     Use --mode mailbox or --mode immediate for full PLL control."
+                );
+            }
+            Some(ctrl)
+        } else {
+            None
+        };
+
         let now = std::time::Instant::now();
         Self {
             surface,
@@ -438,6 +485,9 @@ impl<'a> State<'a> {
             gpu_end_ns: None,
             flip_tracker_warned: false,
             slack_ms: 0.0,
+            prev_cpu_frame_ms: (ideal_period_ns_init * 0.5 / 1_000_000.0) as f32,
+            pll,
+            pll_diag: None,
         }
     }
 
@@ -509,23 +559,32 @@ impl<'a> State<'a> {
             self.flip_tracker_warned = true;
         }
 
-        // Drain the most recent flip event and derive compositor scheduling tax.
-        // `flip_ns − gpu_end_ns` is the time the finished frame spent waiting in
-        // the compositor's buffer queue before the kernel drove it to the display.
-        // Clamp to [0, 2 × ideal_ms] to discard stale events from pipeline flushes.
-        let flip_latency_ms: Option<f32> = self
+        // Drain the most recent flip event.  `flip_ns` is a hardware vblank
+        // timestamp used to anchor both the PLL grid and the PacingAnalyzer phase
+        // grid to the real CLOCK_MONOTONIC scanout epoch.  `flip_latency_ms` is
+        // the compositor scheduling tax (GPU end -> KMS scanout start) logged per
+        // frame.  Both are derived from the same FlipRecord so only one queue pop
+        // is needed.
+        let flip_record = self
             .flip_tracker
             .as_ref()
             .filter(|ft| ft.healthy.load(std::sync::atomic::Ordering::Acquire))
             .and_then(|ft| ft.queue.lock().ok())
-            .and_then(|mut q| q.pop_front())
-            .zip(self.gpu_end_ns)
-            .and_then(|(record, gpu_end)| {
-                let latency_ns = record.flip_ns.saturating_sub(gpu_end);
-                let latency_ms = latency_ns as f32 / 1_000_000.0;
-                let ceiling_ms = self.metrics.frame_budget_ms * 2.0;
-                (latency_ms >= 0.0 && latency_ms < ceiling_ms).then_some(latency_ms)
-            });
+            .and_then(|mut q| q.pop_front());
+
+        // Hardware vblank timestamp forwarded to PacingAnalyzer and PllController
+        // to anchor their phase grids.  `None` when FlipTracker is inactive.
+        let hw_vblank_ns: Option<u64> = flip_record.as_ref().map(|r| r.flip_ns);
+
+        let flip_latency_ms: Option<f32> =
+            flip_record
+                .zip(self.gpu_end_ns)
+                .and_then(|(record, gpu_end)| {
+                    let latency_ns = record.flip_ns.saturating_sub(gpu_end);
+                    let latency_ms = latency_ns as f32 / 1_000_000.0;
+                    let ceiling_ms = self.metrics.frame_budget_ms * 2.0;
+                    (latency_ms >= 0.0 && latency_ms < ceiling_ms).then_some(latency_ms)
+                });
 
         // Write time in one upload before acquire.
         self.current_uniforms.time = self.start_time.elapsed().as_secs_f32();
@@ -533,6 +592,43 @@ impl<'a> State<'a> {
         self.current_uniforms.pacing_decay = self.pacing_decay;
         self.uniform_binding
             .write(&self.queue, &self.current_uniforms);
+
+        // ── PLL pre-submit sleep ──────────────────────────────────────────────
+        // The controller computes an absolute CLOCK_MONOTONIC deadline:
+        //
+        //   deadline = next_vblank - render_budget - PI_correction(phase_drift)
+        //
+        // sleeping until that instant rate-limits the loop to one frame per
+        // vblank period and aligns the submit phase so the finished buffer
+        // arrives at the compositor just before the vblank edge.
+        //
+        // `hw_vblank_ns` seeds the grid from a real hardware vblank edge so the
+        // deadline targets the correct vblank boundary rather than an arbitrary
+        // `now % period` snap that may be half a period off.
+        //
+        // Inputs are all from the *previous* frame: the current frame's
+        // presentation timestamp has not been sampled yet (that happens after
+        // present() below), so one-frame-lag feedback is the only option.
+        // This matches how all real-world PLLs operate.
+        //
+        // A vblank miss resets the integrator so wound-up correction from the
+        // overrun does not fight the recovery on the next frame, and resets the
+        // grid anchor so it re-snaps to the next hardware vblank rather than
+        // continuing to reference a stale pre-miss position.
+        self.pll_diag = self.pll.as_mut().map(|ctrl| {
+            if self.any_vblank_miss_this_frame {
+                ctrl.reset();
+            }
+            let diag = ctrl.compute_deadline(
+                self.pacing.last_phase_drift_ns(),
+                self.pacing.last_vblank_mul(),
+                hw_vblank_ns,
+                gpu_time_ms,
+                self.prev_cpu_frame_ms,
+            );
+            crate::pll::sleep_until(diag.deadline_ns);
+            diag
+        });
 
         // Measure JIT/Back-pressure: How long does the swapchain block us?
         let output = self.surface.get_current_texture()?;
@@ -588,6 +684,7 @@ impl<'a> State<'a> {
         let cpu_submit_ns = clock_monotonic_ns();
         output.present();
         let cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        self.prev_cpu_frame_ms = cpu_frame_ms;
 
         let mut pacing_record = None;
 
@@ -685,6 +782,7 @@ impl<'a> State<'a> {
                 // sync score are captured and logged at full frame resolution.
                 pacing_record = self.pacing.push(
                     now_ns,
+                    hw_vblank_ns,
                     Some(cpu_frame_ms),
                     Some(cpu_submit_ns),
                     gpu_time_ms,
@@ -700,7 +798,12 @@ impl<'a> State<'a> {
                         .benchmark
                         .as_ref()
                         .map_or(self.args.cubes, |b| b.current_cubes);
-                    write_frame_log_row(&mut self.frame_log_file, record, live_cube_count);
+                    write_frame_log_row(
+                        &mut self.frame_log_file,
+                        record,
+                        live_cube_count,
+                        self.pll_diag.as_ref(),
+                    );
 
                     if record.vblank_mul > 1 {
                         self.pacing_decay = 1.0;

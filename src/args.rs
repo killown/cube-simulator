@@ -77,4 +77,48 @@ pub struct Args {
     /// Benchmark results are NOT comparable between the two variants.
     #[arg(long, value_name = "VARIANT", value_parser = ["high", "low"])]
     pub shader: Option<String>,
+    /// Enable the software Phase-Locked Loop for vblank-synchronised frame submission.
+    ///
+    /// When active, a PI controller reads `phase_drift_ns` from the WSI pacing
+    /// analyzer each frame and sleeps for a computed correction duration before
+    /// calling `get_current_texture()`. This shifts the GPU submit instant so
+    /// the finished buffer arrives at the compositor closer to the ideal vblank
+    /// boundary, reducing `phase_drift_ms` and raising `sync_score` toward 100.
+    ///
+    /// # How it works
+    ///
+    /// The controller treats `phase_drift_ns` as the phase error of a PLL:
+    ///
+    /// ```text
+    /// correction = Kp × drift + Ki × Σdrift
+    /// ```
+    ///
+    /// A positive drift (frame presented late) produces a longer pre-submit sleep,
+    /// shifting the next submit earlier relative to the vblank edge. A negative
+    /// drift (frame presented early) reduces or eliminates the sleep.
+    ///
+    /// # Convergence
+    ///
+    /// After 8 consecutive frames with |drift| < 0.5 ms the controller enters
+    /// `Locked` (tracking) mode and halves its gains to avoid injecting jitter
+    /// into an already-stable loop. The lock state is logged to stderr at startup
+    /// and visible in `--frame-log` as `pll_sleep_ns` and `pll_lock`.
+    ///
+    /// # Compatibility
+    ///
+    /// - `--mode mailbox` or `--mode immediate`: **recommended**, the pre-submit
+    ///   sleep has direct control over the submit instant.
+    /// - `--mode fifo`: the driver absorbs the vblank wait internally inside
+    ///   `get_current_texture()`, so sleeping before it has minimal effect. The
+    ///   controller still runs and its log fields remain valid for analysis, but
+    ///   the sleep corrections are mostly consumed by the driver's own blocking.
+    ///
+    /// # Frame log fields added
+    ///
+    /// When `--frame-log` is also passed, each row gains three new fields:
+    /// - `pll_error_ns` — phase error fed into this frame's PI iteration
+    /// - `pll_sleep_ns` — sleep duration actually issued (0 when locked / early)
+    /// - `pll_lock`     — `1` when the controller is in Locked tracking mode
+    #[arg(long, default_value_t = false)]
+    pub pll: bool,
 }

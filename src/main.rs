@@ -6,6 +6,7 @@ mod flip_tracker;
 mod gpu_tier;
 mod gpu_timer;
 mod metrics;
+mod pll;
 mod renderer;
 mod uniforms;
 
