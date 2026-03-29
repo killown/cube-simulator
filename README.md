@@ -42,6 +42,7 @@ To get accurate metrics, you must compile with the release profile to minimize C
 | `--bench-warmup`  | Seconds to skip at start of each benchmark step (compositor warmup).         | 2                |
 | `--bench-max`     | Maximum cube count to probe in benchmark mode.                               | 64               |
 | `--shader`        | Override shader selection (`high` for SDF, `low` for analytic).              | Auto             |
+| `--pll`           | Enable PI controller to sync frame submission with hardware vblank.s.        | `false`          |
 
 ---
 
