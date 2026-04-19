@@ -233,7 +233,7 @@ mod uniforms {
             red: 0.18,
             green: 0.18,
             blue: 0.18,
-            threshold: None,
+            threshold: 0.0,
             format: None,
             mode: None,
             steps: 80,
