@@ -1,5 +1,3 @@
-// gpu_tier.rs
-
 use wgpu::{Adapter, DeviceType};
 
 /// Hardware performance classification used to select the shader variant.
@@ -184,8 +182,8 @@ impl GpuTier {
 }
 
 /// Trims or pads `s` to exactly `width` bytes for fixed-width banner columns.
-fn trim_field(s: &str, width: usize) -> String {
-    if s.len() >= width {
+pub(crate) fn trim_field(s: &str, width: usize) -> String {
+    if s.len() > width {
         format!("{}..", &s[..width.saturating_sub(2)])
     } else {
         format!("{:<width$}", s, width = width)

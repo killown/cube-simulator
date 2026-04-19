@@ -318,7 +318,7 @@ impl PllController {
         // than the hardware vblank grid, causing the deadline to target the wrong
         // vblank boundary and the PLL to fight the compositor rather than align.
         let mul = last_vblank_mul.max(1) as u64;
-        let next_vblank = match self.next_vblank_ns {
+        let mut next_vblank = match self.next_vblank_ns {
             None => {
                 if let Some(flip_ns) = hw_vblank_ns {
                     // Snap forward from the hardware vblank to find the next
@@ -335,6 +335,12 @@ impl PllController {
             }
             Some(prev) => prev + self.ideal_period_ns * mul,
         };
+
+        // If the calculated vblank is in the past, snap it forward until it is
+        // in the future. This prevents massive sleep_ns values when frames stall.
+        while next_vblank <= now_ns {
+            next_vblank += self.ideal_period_ns;
+        }
         self.next_vblank_ns = Some(next_vblank);
 
         // ── PI correction ─────────────────────────────────────────────────────
@@ -383,14 +389,13 @@ impl PllController {
         //
         // A negative PI correction (frame was early) adds to the deadline,
         // pushing the submit slightly later to avoid the opposite overshoot.
-        let deadline_ns = if raw_correction >= 0 {
-            next_vblank
-                .saturating_sub(self.render_budget_ns)
-                .saturating_sub(raw_correction as u64)
-        } else {
-            next_vblank
-                .saturating_sub(self.render_budget_ns)
-                .saturating_add(raw_correction.unsigned_abs())
+        let deadline_ns = {
+            let base = next_vblank.saturating_sub(self.render_budget_ns);
+            if raw_correction >= 0 {
+                base.saturating_sub(raw_correction as u64)
+            } else {
+                base.saturating_add(raw_correction.unsigned_abs())
+            }
         };
 
         // If the deadline has already passed (frame is running late), skip the
@@ -398,7 +403,13 @@ impl PllController {
         // miss and advance the grid via `mul` on the next call.
         let sleep_ns = if deadline_ns > now_ns {
             let delta = deadline_ns - now_ns;
-            if delta >= MIN_SLEEP_NS { delta } else { 0 }
+            // Prevent divergence: if the delta is physically impossible (> 2 periods),
+            // clamp it to zero to force immediate execution and resync.
+            if delta >= MIN_SLEEP_NS && delta < self.ideal_period_ns * 2 {
+                delta
+            } else {
+                0
+            }
         } else {
             0
         };

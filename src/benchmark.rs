@@ -75,8 +75,8 @@ impl BenchScore {
     ///
     /// `results` must be the final slice from [`BenchmarkState`]; the last
     /// entry may or may not carry a trigger.
-    fn compute(results: &[BenchStepResult]) -> Self {
-        let clean_cubes = results.iter().filter(|r| r.trigger.is_none()).count() as u32;
+    pub(crate) fn compute(results: &[BenchStepResult]) -> Self {
+        let clean_cubes = results.iter().take_while(|r| r.trigger.is_none()).count() as u32;
         let clean_points = clean_cubes * POINTS_PER_CLEAN_CUBE;
 
         let trigger_entry = results.iter().find(|r| r.trigger.is_some());

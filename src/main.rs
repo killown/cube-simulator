@@ -16,6 +16,9 @@ use winit::event_loop::EventLoop;
 use app::App;
 use args::Args;
 
+#[cfg(test)]
+mod tests;
+
 fn main() {
     let args = Args::parse();
 

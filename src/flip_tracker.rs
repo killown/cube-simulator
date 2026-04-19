@@ -200,7 +200,14 @@ fn read_drm_events(drm_fd: libc::c_int) -> std::io::Result<Vec<FlipRecord>> {
         return Err(std::io::Error::last_os_error());
     }
 
-    let data = &buf[..n as usize];
+    Ok(read_drm_events_from_buf(&buf[..n as usize]))
+}
+
+/// Parses all `DRM_EVENT_FLIP_COMPLETE` records from a raw byte slice.
+///
+/// Extracted from [`read_drm_events`] so the ABI parsing logic can be exercised
+/// in unit tests without a live DRM file descriptor.
+pub(crate) fn read_drm_events_from_buf(data: &[u8]) -> Vec<FlipRecord> {
     let mut records = Vec::new();
     let mut offset = 0usize;
 
@@ -229,7 +236,7 @@ fn read_drm_events(drm_fd: libc::c_int) -> std::io::Result<Vec<FlipRecord>> {
         offset += event_len;
     }
 
-    Ok(records)
+    records
 }
 
 /// Creates an `epoll` instance and registers `drm_fd` for `EPOLLIN` events.
