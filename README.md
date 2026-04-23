@@ -17,7 +17,7 @@ For a detailed breakdown of the metrics and internal mechanics, see the Project 
 To get accurate metrics, you must compile with the release profile to minimize CPU-side scheduling interference and driver overhead:
 
     cargo build --release
-    ./target/release/frame-test -c 30
+    target/release/frame-test --connector DP-1 --bench-secs 3 --mode fifo
 
 
 ### CLI Parameters
