@@ -20,7 +20,7 @@ use args::Args;
 mod tests;
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if args
         .bench_secs
@@ -37,7 +37,7 @@ fn main() {
     let drm_info = drm::query();
 
     match (&args.connector, &drm_info) {
-        // No --connector supplied: print what's available and require the user to choose.
+        // No --connector supplied: try to auto-pick the only active one or warn about multi-output.
         (None, Some(info)) => {
             let active: Vec<_> = info
                 .connectors
@@ -45,38 +45,27 @@ fn main() {
                 .filter(|c| c.active_mode.is_some())
                 .collect();
 
-            if active.len() == 1 {
-                let mut auto_args = args;
-                auto_args.connector = Some(active[0].name.clone());
-                eprintln!("Auto-selecting only active connector: {}", active[0].name);
-                run(auto_args, drm_info);
-                return;
-            }
-
             if !active.is_empty() {
-                eprintln!("Active display outputs detected:");
-                for c in &active {
-                    if let Some(m) = &c.active_mode {
-                        let vrr = match c.vrr_enabled {
-                            Some(true) => " (VRR: On)",
-                            Some(false) => " (VRR: Off)",
-                            None => "",
-                        };
-                        eprintln!(
-                            "  --connector {}  ({}x{} @ {}Hz{})",
-                            c.name, m.width, m.height, m.refresh_hz, vrr
-                        );
-                    }
+                let selected = active[0].name.clone();
+                if active.len() > 1 {
+                    eprintln!(
+                        "WARNING: Multi-output setup detected ({} monitors active).",
+                        active.len()
+                    );
+                    eprintln!(
+                        "Auto-selecting primary: {}. Benchmark results may be inconsistent.",
+                        selected
+                    );
+                    eprintln!("Recommendation: Disable secondary monitors for maximum accuracy.");
+                } else {
+                    eprintln!("Auto-selecting connector: {}", selected);
                 }
-                eprintln!("\nRe-run with --connector <name> to select the output under test.");
-                std::process::exit(1);
+                args.connector = Some(selected);
             }
-
-            // DRM available but no active connectors, fall through with winit fallback.
             run(args, drm_info);
         }
 
-        // --connector supplied but DRM is unavailable or the name isn't found.
+        // --connector supplied: verify it exists, otherwise fallback to the first active one.
         (Some(name), info) => {
             let found = info
                 .as_ref()
@@ -86,18 +75,48 @@ fn main() {
             if !found {
                 eprintln!("Error: connector '{}' not found in DRM topology.", name);
                 if let Some(i) = info {
-                    eprintln!("Available connectors:");
-                    i.print();
-                } else {
-                    eprintln!("(DRM unavailable on this system)");
+                    let active: Vec<_> = i
+                        .connectors
+                        .iter()
+                        .filter(|c| c.active_mode.is_some())
+                        .collect();
+                    if !active.is_empty() {
+                        let fallback = active[0].name.clone();
+                        eprintln!(
+                            "FALLBACK: Using available connector '{}' instead.",
+                            fallback
+                        );
+                        if active.len() > 1 {
+                            eprintln!(
+                                "CRITICAL: Multi-output active. Test environment is UNRELIABLE."
+                            );
+                            eprintln!(
+                                "Please disable secondary outputs to ensure accurate frame pacing logs."
+                            );
+                        }
+                        args.connector = Some(fallback);
+                    }
                 }
-                std::process::exit(1);
+            } else {
+                eprintln!("Targeting output: {}", name);
+                if let Some(i) = info {
+                    let active_count = i
+                        .connectors
+                        .iter()
+                        .filter(|c| c.active_mode.is_some())
+                        .count();
+                    if active_count > 1 {
+                        eprintln!(
+                            "Warning: Multi-output detected. Performance may be degraded by compositor overhead."
+                        );
+                    }
+                }
             }
 
             run(args, drm_info);
         }
 
-        // No --connector and no DRM, proceed with winit fallback, warn once.
+        // No --connector and no DRM, proceed with winit fallback.
         (None, None) => {
             eprintln!(
                 "WARN: DRM unavailable, refresh rate from winit may be wrong. \
