@@ -492,7 +492,14 @@ impl<'a> State<'a> {
     }
 
     /// Encodes and submits one frame, then updates per-frame timing metrics.
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    ///
+    /// Returns `false` when the frame was skipped due to a surface error that
+    /// cannot be recovered within this call (`Timeout`, `OutOfMemory`).
+    /// `Outdated` and `Lost` are handled internally via reconfigure.
+    /// `Suboptimal` renders into the valid-but-non-ideal texture and triggers a
+    /// deferred reconfigure after `present()` so the submission pipeline is not
+    /// interrupted mid-flight.
+    pub fn render(&mut self) -> bool {
         // Snapshot before acquire so delta excludes swapchain stall
         let frame_start = std::time::Instant::now();
         let total_frame_delta = frame_start
@@ -630,8 +637,35 @@ impl<'a> State<'a> {
             diag
         });
 
-        // Measure JIT/Back-pressure: How long does the swapchain block us?
-        let output = self.surface.get_current_texture()?;
+        // Acquire the next swapchain image, handling every outcome explicitly.
+        //
+        // `Suboptimal` still carries a valid texture and is rendered into so the
+        // frame metrics pipeline does not see a spurious dropped frame; the surface
+        // is reconfigured after `present()` so the submission pipeline is not
+        // interrupted mid-flight.
+        //
+        // `Outdated` / `Lost` reconfigure immediately and skip the frame to avoid
+        // submitting work against a torn/undefined surface.
+        //
+        // `Timeout` / `OutOfMemory` are unrecoverable within this call; skip and
+        // let the next `RedrawRequested` retry.
+        let (output, suboptimal) = match self.surface.get_current_texture() {
+            Ok(frame) => {
+                let sub = frame.suboptimal;
+                (frame, sub)
+            }
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return false;
+            }
+            Err(
+                wgpu::SurfaceError::Timeout
+                | wgpu::SurfaceError::OutOfMemory
+                | wgpu::SurfaceError::Other,
+            ) => {
+                return false;
+            }
+        };
 
         let view = output
             .texture
@@ -683,6 +717,13 @@ impl<'a> State<'a> {
         // without any anchor arithmetic or accumulated error.
         let cpu_submit_ns = clock_monotonic_ns();
         output.present();
+        // Deferred reconfigure: surface was `Suboptimal` on this frame's acquire.
+        // Reconfiguring after `present()` ensures the submitted command buffer
+        // targets a consistent surface configuration, avoiding a validation error
+        // on backends that forbid reconfiguring a surface with in-flight work.
+        if suboptimal {
+            self.surface.configure(&self.device, &self.config);
+        }
         let cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         self.prev_cpu_frame_ms = cpu_frame_ms;
 
@@ -919,7 +960,7 @@ impl<'a> State<'a> {
             }
         }
 
-        Ok(())
+        true
     }
 }
 

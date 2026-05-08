@@ -78,12 +78,12 @@ impl<'a> ApplicationHandler for App<'a> {
                     state.surface.configure(&state.device, &state.config);
                 }
                 WindowEvent::RedrawRequested => {
-                    let _ = state.render();
+                    let rendered = state.render();
 
                     // A completed benchmark terminates the event loop and prints
                     // the report. The render() call above still completes so the
                     // final frame (with the triggering cube count) is presented.
-                    if state.benchmark_done {
+                    if rendered && state.benchmark_done {
                         if let Some(bench) = &state.benchmark {
                             bench.print_report();
                         }
