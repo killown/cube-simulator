@@ -153,9 +153,12 @@ impl<'a> State<'a> {
         drm_info: Option<crate::drm::DrmInfo>,
     ) -> State<'a> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
         // Connector-pinned refresh rate is the only reliable source on multi-monitor
@@ -377,7 +380,7 @@ impl<'a> State<'a> {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&uniform_binding.layout],
+            bind_group_layouts: &[Some(&uniform_binding.layout)],
             immediate_size: 0,
         });
 
@@ -647,22 +650,18 @@ impl<'a> State<'a> {
         // `Outdated` / `Lost` reconfigure immediately and skip the frame to avoid
         // submitting work against a torn/undefined surface.
         //
-        // `Timeout` / `OutOfMemory` are unrecoverable within this call; skip and
-        // let the next `RedrawRequested` retry.
+        // `Timeout` / `Occluded` / `Validation` are unrecoverable within this call,
+        // skip and let the next `RedrawRequested` retry.
         let (output, suboptimal) = match self.surface.get_current_texture() {
-            Ok(frame) => {
-                let sub = frame.suboptimal;
-                (frame, sub)
-            }
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 return false;
             }
-            Err(
-                wgpu::SurfaceError::Timeout
-                | wgpu::SurfaceError::OutOfMemory
-                | wgpu::SurfaceError::Other,
-            ) => {
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => {
                 return false;
             }
         };
