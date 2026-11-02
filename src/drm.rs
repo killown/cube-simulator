@@ -21,7 +21,39 @@ impl ControlDevice for Card {}
 pub struct ActiveMode {
     pub width: u16,
     pub height: u16,
+    /// Whole-Hz refresh as reported by the kernel (`drm_mode_vrefresh`, rounded).
+    /// For display only, use `refresh_mhz` for any timing arithmetic.
     pub refresh_hz: u32,
+    /// Exact refresh in millihertz computed from the mode timings
+    /// (`clock / (htotal * vtotal)`), so 59.94 Hz stays 59940 instead of becoming 60.
+    pub refresh_mhz: u32,
+}
+
+/// Exact refresh rate in millihertz, mirroring the kernel's `drm_mode_vrefresh()`
+/// (interlace x2, doublescan /2, vscan divisor) without rounding to whole Hz.
+/// Falls back to `vrefresh * 1000` when the timings are unusable.
+fn mode_refresh_mhz(m: &drm::control::Mode) -> u32 {
+    use drm::control::ModeFlags;
+
+    let clock_khz = m.clock() as u64;
+    let htotal = m.hsync().2 as u64;
+    let vtotal = m.vsync().2 as u64;
+    if clock_khz == 0 || htotal == 0 || vtotal == 0 {
+        return m.vrefresh() * 1000;
+    }
+
+    let mut num = clock_khz * 1_000_000;
+    let mut den = htotal * vtotal;
+    if m.flags().contains(ModeFlags::INTERLACE) {
+        num *= 2;
+    }
+    if m.flags().contains(ModeFlags::DBLSCAN) {
+        den *= 2;
+    }
+    if m.vscan() > 1 {
+        den *= m.vscan() as u64;
+    }
+    ((num + den / 2) / den) as u32
 }
 
 /// Discovered properties of one display output.
@@ -61,11 +93,34 @@ impl DrmInfo {
                     None => "",
                 };
                 println!(
-                    "{}: {}x{} @ {}Hz{}",
-                    c.name, m.width, m.height, m.refresh_hz, vrr
+                    "{}: {}x{} @ {:.3}Hz{}",
+                    c.name,
+                    m.width,
+                    m.height,
+                    m.refresh_mhz as f64 / 1000.0,
+                    vrr
                 );
             }
         }
+    }
+
+    /// Returns the exact refresh rate (millihertz) of the named connector, or
+    /// `None` if not found or the connector has no active mode.
+    pub fn find_refresh_mhz(&self, name: &str) -> Option<u32> {
+        self.connectors
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .and_then(|c| c.active_mode.as_ref())
+            .map(|m| m.refresh_mhz)
+    }
+
+    /// Returns the CRTC `VRR_ENABLED` state of the named connector, or `None` if
+    /// the connector is unknown or the property is not exposed.
+    pub fn find_vrr_enabled(&self, name: &str) -> Option<bool> {
+        self.connectors
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .and_then(|c| c.vrr_enabled)
     }
 
     /// Returns the refresh rate of the named connector, or `None` if not found
@@ -82,7 +137,7 @@ impl DrmInfo {
 /// Opens the first available DRM device node and queries its full topology.
 ///
 /// Tries `/dev/dri/card0` through `card9` in order, returning `None` if no
-/// node can be opened or the DRM ioctls fail. Non-fatal — the caller should
+/// node can be opened or the DRM ioctls fail. Non-fatal - the caller should
 /// degrade gracefully and continue without DRM info.
 ///
 /// The `primary_crtc` field in the returned [`DrmInfo`] is populated with the
@@ -124,6 +179,7 @@ pub fn query() -> Option<DrmInfo> {
                             width: m.size().0,
                             height: m.size().1,
                             refresh_hz: m.vrefresh(),
+                            refresh_mhz: mode_refresh_mhz(&m),
                         })
                     })
             });

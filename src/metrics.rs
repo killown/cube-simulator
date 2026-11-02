@@ -12,10 +12,10 @@ pub struct FrameMetrics {
     pub min_fps: f32,
     pub max_fps: f32,
     pub last_fps_update: std::time::Instant,
-    /// Ring of raw hardware presentation timestamps (nanoseconds).
-    /// `None` slots mean the backend returned `UNSUPPORTED`.
+    /// Ring of compositor-reported scanout timestamps (nanoseconds, `wp_presentation`
+    /// with `HW_CLOCK`). `None` slots mean no scanout timestamp was available.
     presentation_timestamps: VecDeque<Option<u64>>,
-    /// Whether the backend has ever returned a valid hardware timestamp.
+    /// Whether a scanout timestamp has ever been received.
     hw_timestamps_available: bool,
 }
 
@@ -38,7 +38,7 @@ pub struct TickStats {
 /// A single frame's pacing record derived from hardware presentation timestamps.
 ///
 /// Every field is annotated with the compositor-development question it answers.
-/// CPU-domain fields (`cpu_frame_ms`, `slack_ms`) are explicitly marked; all
+/// CPU-domain fields (`cpu_frame_ms`, `slack_ms`) are explicitly marked, all
 /// timestamp fields originate from the WSI/KMS clock (CLOCK_MONOTONIC domain).
 #[derive(Debug, Clone, Copy)]
 pub struct FramePacingRecord {
@@ -46,7 +46,8 @@ pub struct FramePacingRecord {
     pub frame_index: u64,
 
     // ── Presentation clock ───────────────────────────────────────────────────
-    /// Absolute KMS/WSI presentation timestamp for this frame (nanoseconds).
+    /// Absolute scanout timestamp for this frame (nanoseconds), from
+    /// `wp_presentation` feedback with `HW_CLOCK`.
     ///
     /// Directly comparable to `wl_surface.frame` callback timestamps and
     /// `DRM_IOCTL_WAIT_VBLANK` reply timestamps, same CLOCK_MONOTONIC epoch.
@@ -64,7 +65,7 @@ pub struct FramePacingRecord {
     /// Signed deviation from the nearest ideal vblank boundary (milliseconds).
     ///
     /// Positive = frame arrived late (missed its slot, presented on next vblank).
-    /// Negative = frame arrived early (unlikely on vsync'd paths; possible on Immediate).
+    /// Negative = frame arrived early (unlikely on vsync'd paths, possible on Immediate).
     /// Clamped to `±(ideal_ms / 2)` so it always names the *nearest* boundary, not
     /// an accumulated offset, a value of +8 ms on a 16 ms budget means one half-period
     /// late, regardless of how many previous frames drifted.
@@ -111,7 +112,7 @@ pub struct FramePacingRecord {
     /// - `delta_ms ≈ cpu_frame_ms` → frame was scanned out immediately after CPU work.
     /// - `delta_ms >> cpu_frame_ms` → compositor held the buffer (`max_render_time`
     ///   inflation, triple-buffer queue depth > 1, Wayland frame-callback throttling).
-    /// - `delta_ms < cpu_frame_ms` → impossible on vsync'd paths; indicates clock skew.
+    /// - `delta_ms < cpu_frame_ms` → impossible on vsync'd paths, indicates clock skew.
     ///
     /// `None` when not supplied to [`PacingAnalyzer::push`].
     pub cpu_frame_ms: Option<f32>,
@@ -123,9 +124,9 @@ pub struct FramePacingRecord {
     /// On a healthy single-vblank Fifo path: `slack_ms ≈ ideal_ms`.
     ///
     /// Cross-reference with `phase_drift_ms` to locate the bottleneck:
-    /// - `drift high` + `slack high` → GPU finished well before vblank; buffer sat in
+    /// - `drift high` + `slack high` → GPU finished well before vblank, buffer sat in
     ///   the compositor's queue, **compositor scheduling policy** is the bottleneck.
-    /// - `drift high` + `slack ≈ 0`  → GPU was still executing at vblank time —
+    /// - `drift high` + `slack ≈ 0`  → GPU was still executing at vblank time -
     ///   **GPU render budget** was exceeded.
     /// - `drift low`  + `slack ≈ ideal_ms` → healthy, one-vblank pipeline.
     ///
@@ -140,7 +141,7 @@ pub struct FramePacingRecord {
     /// budget?", `slack_ms` cannot distinguish GPU overrun from compositor hold.
     ///
     /// Cross-reference:
-    /// - `gpu_time_ms > ideal_ms`         → GPU render budget exceeded; reduce load.
+    /// - `gpu_time_ms > ideal_ms`         → GPU render budget exceeded, reduce load.
     /// - `gpu_time_ms < ideal_ms` + high drift → compositor scheduling bottleneck.
     /// - `gpu_time_ms ≈ 0`                → query not supported or not yet resolved.
     ///
@@ -255,7 +256,7 @@ pub struct PacingAnalyzer {
     /// frame landed exactly on a real hardware vblank edge.
     ///
     /// `None` until the first flip event arrives.  Never overwritten once set
-    /// (all flip events share the same epoch); cleared on discontinuity so a
+    /// (all flip events share the same epoch), cleared on discontinuity so a
     /// compositor restart re-anchors cleanly.
     hw_vblank_anchor_ns: Option<u64>,
 }
@@ -291,8 +292,8 @@ impl PacingAnalyzer {
     /// and produce phantom drift on every subsequent frame.
     ///
     /// # Arguments
-    /// * `ts_ns`, Raw KMS/WSI nanosecond timestamp from
-    ///   `adapter.get_presentation_timestamp()`.  Must be CLOCK_MONOTONIC domain.
+    /// * `ts_ns`, Scanout time (ns) from `wp_presentation_feedback.presented`
+    ///   with `HW_CLOCK` set. Must be CLOCK_MONOTONIC domain. Never a CPU clock read.
     /// * `hw_vblank_ns`, `CLOCK_MONOTONIC` timestamp of the hardware vblank edge
     ///   from `DRM_EVENT_FLIP_COMPLETE`, if one was delivered this frame.  When
     ///   `Some`, the phase grid is anchored to the real scanout clock so
@@ -359,7 +360,7 @@ impl PacingAnalyzer {
         // Drift = 0 means the WSI timestamp landed exactly on a hardware vblank edge.
         //
         // Without a hardware anchor: origin = the WSI timestamp of the first frame,
-        // a floating origin.  Drift is consistent (relative) but not absolute —
+        // a floating origin.  Drift is consistent (relative) but not absolute -
         // the zero point is wherever the first frame happened to land.
         let origin = match self.hw_vblank_anchor_ns {
             Some(anchor) => {
@@ -474,7 +475,7 @@ impl FrameMetrics {
     pub fn new(frame_budget_ms: f32) -> Self {
         let now = std::time::Instant::now();
         // Cap the ring to 30 seconds of frames at the reported refresh rate.
-        // A fixed count of 3600 is only ~15 s at 240 Hz and ~2 min at 30 Hz;
+        // A fixed count of 3600 is only ~15 s at 240 Hz and ~2 min at 30 Hz,
         // tying the cap to the frame budget gives a consistent analysis window
         // regardless of refresh rate.
         let ring_cap = ((30_000.0 / frame_budget_ms).ceil() as usize).max(256);
@@ -493,14 +494,13 @@ impl FrameMetrics {
         }
     }
 
-    /// Records one frame delta and its hardware presentation timestamp.
+    /// Records one frame delta and its scanout timestamp.
     ///
-    /// `presentation_ts` should come directly from
-    /// `wgpu::Queue::get_timestamp_period`-gated `SurfaceTexture::presentation_timestamp()`.
-    /// When the backend returns [`wgpu::PresentationTimestamp::INVALID`], pass `None`
-    /// and the metric pipeline falls back to CPU-side deltas with `hw_verified: false`.
+    /// `presentation_ts` is the `wp_presentation` `HW_CLOCK` presented time.
+    /// When none is available, pass `None` and the metric pipeline falls back to
+    /// CPU-side deltas with `hw_verified: false`.
     ///
-    /// Returns `Some(TickStats)` every 500ms update interval; `None` otherwise.
+    /// Returns `Some(TickStats)` every 500ms update interval, `None` otherwise.
     pub fn push(
         &mut self,
         delta_ms: f32,
@@ -627,7 +627,7 @@ impl FrameMetrics {
 
         ts.windows(2)
             .map(|w| {
-                // nanoseconds → milliseconds; saturating to avoid wrapping on
+                // nanoseconds → milliseconds, saturating to avoid wrapping on
                 // timestamp resets (e.g. CLOCK_MONOTONIC discontinuities).
                 w[1].saturating_sub(w[0]) as f32 / 1_000_000.0
             })
@@ -703,7 +703,7 @@ impl FrameMetrics {
 /// Writes a CSV row for a completed tick, if a file handle is present.
 ///
 /// The header (`FPS,MIN,MAX,LOW_1,JITTER,DROPPED,FTV`) is written once at
-/// file creation time in [`State::new`]; this function only appends rows.
+/// file creation time in [`State::new`], this function only appends rows.
 pub fn write_csv_row(file: &mut Option<File>, stats: &TickStats) {
     if let Some(f) = file {
         let _ = writeln!(
@@ -748,29 +748,29 @@ pub fn write_json_row(file: &mut Option<File>, stats: &TickStats) {
 /// into how each individual frame landed relative to the ideal vblank grid.
 ///
 /// # Fields emitted
-/// - `schema`           — version tag, increment when the field set changes
-/// - `frame`            — monotonic frame index since session start
-/// - `cube_count`       — cube count active during this frame
-/// - `ts_ns`            — raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
-/// - `delta_ms`         — measured inter-frame interval on the presentation clock
-/// - `ideal_ms`         — target vblank period from monitor refresh rate
-/// - `drift_ms`         — signed deviation from nearest vblank boundary (+ = late, − = early)
-/// - `drift_ns`         — same drift at nanosecond precision (for PLL / repaint-timer use)
-/// - `vblank_mul`       — vblank periods consumed (1 = on-time, 2 = one dropped, ≥3 = stall)
-/// - `sync`             — 0–100 quality score (100 = perfectly on-vblank)
-/// - `ipc_delta_ms`     — instantaneous Δ between this and the previous `delta_ms`
-/// - `cpu_frame_ms`     — CPU-observed total frame time
-/// - `slack_ms`         — `present_ts − submit_cpu`: GPU execution + flip pipeline depth
-/// - `gpu_time_ms`      — true GPU render-pass execution time from hardware timestamp queries
-/// - `micro_driver_ms`  — Vulkan driver command-buffer submission latency (encoder bracket)
-/// - `micro_resolve_ms` — GPU DMA + PCIe copy overhead for timestamp readback resolve
-/// - `micro_total_ms`   — full GPU pipeline span: driver + shader + resolve combined
-/// - `flip_latency_ms`  — compositor scheduling tax: GPU end → KMS scanout start
-/// - `pll_error_ns`     — phase error fed into the PLL PI controller this frame (signed ns)
-/// - `pll_sleep_ns`     — sleep duration issued by the PLL before `get_current_texture()`
-/// - `pll_deadline_ns`  — absolute CLOCK_MONOTONIC deadline the PLL slept until
-/// - `pll_budget_ns`    — render budget EMA used to compute the deadline
-/// - `pll_lock`         — `1` when the PLL is in Locked (tracking) mode, `0` while acquiring
+/// - `schema`           - version tag, increment when the field set changes
+/// - `frame`            - monotonic frame index since session start
+/// - `cube_count`       - cube count active during this frame
+/// - `ts_ns`            - raw KMS/WSI presentation timestamp (ns, CLOCK_MONOTONIC)
+/// - `delta_ms`         - measured inter-frame interval on the presentation clock
+/// - `ideal_ms`         - target vblank period from monitor refresh rate
+/// - `drift_ms`         - signed deviation from nearest vblank boundary (+ = late, − = early)
+/// - `drift_ns`         - same drift at nanosecond precision (for PLL / repaint-timer use)
+/// - `vblank_mul`       - vblank periods consumed (1 = on-time, 2 = one dropped, ≥3 = stall)
+/// - `sync`             - 0–100 quality score (100 = perfectly on-vblank)
+/// - `ipc_delta_ms`     - instantaneous Δ between this and the previous `delta_ms`
+/// - `cpu_frame_ms`     - CPU-observed total frame time
+/// - `slack_ms`         - `present_ts − submit_cpu`: GPU execution + flip pipeline depth
+/// - `gpu_time_ms`      - true GPU render-pass execution time from hardware timestamp queries
+/// - `micro_driver_ms`  - Vulkan driver command-buffer submission latency (encoder bracket)
+/// - `micro_resolve_ms` - GPU DMA + PCIe copy overhead for timestamp readback resolve
+/// - `micro_total_ms`   - full GPU pipeline span: driver + shader + resolve combined
+/// - `flip_latency_ms`  - compositor scheduling tax: GPU end → KMS scanout start
+/// - `pll_error_ns`     - phase error fed into the PLL PI controller this frame (signed ns)
+/// - `pll_sleep_ns`     - sleep duration issued by the PLL before `get_current_texture()`
+/// - `pll_deadline_ns`  - absolute CLOCK_MONOTONIC deadline the PLL slept until
+/// - `pll_budget_ns`    - render budget EMA used to compute the deadline
+/// - `pll_lock`         - `1` when the PLL is in Locked (tracking) mode, `0` while acquiring
 ///
 /// Optional fields are omitted from the JSON object entirely when `None`.
 pub fn write_frame_log_row(

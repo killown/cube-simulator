@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
@@ -14,6 +15,17 @@ use crate::metrics::{
 };
 use crate::pll::{PllController, PllDiagnostics};
 use crate::uniforms::{ShaderUniforms, UniformBinding};
+use crate::wp_presentation::{PresentEvent, WP_FLAG_HW_CLOCK, WP_FLAG_VSYNC, WpPresentation};
+
+/// Per-submit data held until the compositor reports when that frame was shown.
+#[derive(Clone, Copy)]
+struct SubmitInfo {
+    cpu_frame_ms: f32,
+    cpu_submit_ns: u64,
+    gpu_time_ms: Option<f32>,
+    micro: Option<crate::gpu_timer::MicroTimings>,
+    flip_latency_ms: Option<f32>,
+}
 
 /// Full GPU rendering state for one window.
 ///
@@ -26,8 +38,6 @@ pub struct State<'a> {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub window: Arc<Window>,
-    /// Retained to call `get_presentation_timestamp()` each frame.
-    adapter: wgpu::Adapter,
     render_pipeline: wgpu::RenderPipeline,
     uniform_binding: UniformBinding,
     start_time: std::time::Instant,
@@ -42,13 +52,13 @@ pub struct State<'a> {
     pacing: PacingAnalyzer,
     csv_file: Option<File>,
     json_file: Option<File>,
-    /// Per-frame NDJSON pacing log; `None` when `--frame-log` is not passed or
+    /// Per-frame NDJSON pacing log, `None` when `--frame-log` is not passed or
     /// when the backend returns invalid presentation timestamps.
     frame_log_file: Option<File>,
     args: Args,
     current_uniforms: ShaderUniforms,
     /// Per-frame decaying stutter intensity. Set to `1.0` when a frame is
-    /// detected as dropped or jitter exceeds the configured threshold;
+    /// detected as dropped or jitter exceeds the configured threshold,
     /// decremented by `STUTTER_DECAY_RATE` each frame toward `0.0`.
     stutter_decay: f32,
     /// Exponential moving average of `vblank_mul` sampled each frame from
@@ -57,26 +67,31 @@ pub struct State<'a> {
     /// smooths over isolated spikes so only regime-level badness triggers yellow.
     vblank_mul_ema: f32,
     /// Decaying compositor-pressure indicator.  Set to `1.0` when
-    /// `vblank_mul_ema` exceeds the `PACING_EMA_THRESHOLD`; decays at
+    /// `vblank_mul_ema` exceeds the `PACING_EMA_THRESHOLD`, decays at
     /// `PACING_DECAY_RATE` per frame when delivery recovers.
     pacing_decay: f32,
-    /// Active benchmark state machine; `None` when not in `--bench-secs` mode.
+    /// Active benchmark state machine, `None` when not in `--bench-secs` mode.
     pub benchmark: Option<BenchmarkState>,
     /// Set to `true` on the frame where the benchmark terminates, signalling the
     /// app layer to call `el.exit()` after this `RedrawRequested` completes.
     pub benchmark_done: bool,
     /// Whether the most-recently-processed pacing record had `vblank_mul > 1`.
-    /// Reset each frame; fed into the benchmark tick.
+    /// Reset each frame, fed into the benchmark tick.
     any_vblank_miss_this_frame: bool,
-    /// Hardware GPU execution timer. Wraps a `TIMESTAMP_QUERY` `QuerySet`; is a
+    /// Hardware GPU execution timer. Wraps a `TIMESTAMP_QUERY` `QuerySet`, is a
     /// zero-cost no-op when the adapter does not support the feature.
     gpu_timer: GpuTimer,
-    /// Shader tier selected at startup; used to gate benchmark-mode animation
+    /// Shader tier selected at startup, used to gate benchmark-mode animation
     /// freeze to the low-end shader only (the high-end SDF cost is position-invariant).
     gpu_tier: GpuTier,
-    /// Last printed `raw_vblank_mul`; suppresses duplicate `[MICRO]` lines when
+    /// Last printed `raw_vblank_mul`, suppresses duplicate `[MICRO]` lines when
     /// two consecutive WSI deltas both reflect the same overrun event.
     last_micro_vblank_mul: u32,
+    /// `VRR_ENABLED` of the target connector's CRTC (`None` when unknown).
+    drm_vrr: Option<bool>,
+    /// Set once the startup refresh rate has been cross-checked against the
+    /// compositor's first `wp_presentation` feedback.
+    refresh_verified: bool,
     /// Async DRM page-flip tracker, `None` when DRM is unavailable or the CRTC
     /// handle could not be resolved.  When present, drains `FlipRecord`s each
     /// frame to compute `flip_latency_ms = flip_ns − gpu_end_ns`.
@@ -113,6 +128,15 @@ pub struct State<'a> {
     /// call.  `None` when `--pll` is inactive.  Stored so [`write_frame_log_row`]
     /// can emit the pll fields without borrowing the controller mid-frame.
     pll_diag: Option<PllDiagnostics>,
+    /// Wayland `wp_presentation` feedback, `None` off-Wayland or when the
+    /// compositor lacks the protocol (falls back to `get_presentation_timestamp`).
+    wp: Option<WpPresentation>,
+    /// Submits awaiting their `presented`/`discarded` event, keyed by feedback token.
+    wp_pending: VecDeque<(u64, SubmitInfo)>,
+    /// Most recent VSYNC-flagged presentation time, used as the vblank grid anchor.
+    wp_vsync_ns: Option<u64>,
+    /// Set once the first feedback's clock quality (`HW_CLOCK`) has been reported.
+    wp_clock_reported: bool,
 }
 
 /// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
@@ -120,12 +144,12 @@ pub struct State<'a> {
 /// that `submit_ns, present_ts` produces an accurate `slack_ms` without any
 /// anchor arithmetic.
 ///
-/// Falls back to `0` only on platforms where the syscall is unavailable; the
+/// Falls back to `0` only on platforms where the syscall is unavailable, the
 /// caller treats `0` as `None` in the pacing filter (`gap_ms > 0.0`).
 #[cfg(target_os = "linux")]
 #[inline]
 fn clock_monotonic_ns() -> u64 {
-    // SAFETY: `timespec` is zero-initialised before the syscall writes it;
+    // SAFETY: `timespec` is zero-initialised before the syscall writes it,
     // `CLOCK_MONOTONIC` (1) is a valid, always-present clock id on Linux.
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -164,28 +188,61 @@ impl<'a> State<'a> {
         // Connector-pinned refresh rate is the only reliable source on multi-monitor
         // setups. winit asks the compositor, which may report a virtual 60Hz rate
         // even on a 165Hz panel. DRM talks directly to KMS and is always correct.
-        let frame_budget_ms = args
+        //
+        // The DRM value comes from the mode timings in millihertz, not the rounded
+        // whole-Hz `vrefresh`: 59.94 Hz must not become 60 Hz, or the phase grid
+        // drifts ~0.1% and sync_score degrades for no real reason.
+        let (frame_budget_ms, refresh_source) = if let Some(mhz) = args
             .connector
             .as_deref()
-            .and_then(|name| drm_info.as_ref()?.find_refresh_hz(name))
-            .map(|hz| 1000.0 / hz as f32)
-            .or_else(|| {
-                window
-                    .current_monitor()
-                    .and_then(|m| m.refresh_rate_millihertz())
-                    .map(|mhz| 1_000_000.0 / mhz as f32)
-            })
-            .unwrap_or(1000.0 / 60.0);
+            .and_then(|name| drm_info.as_ref()?.find_refresh_mhz(name))
+        {
+            ((1_000_000.0 / mhz as f64) as f32, "DRM mode timings")
+        } else if let Some(mhz) = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+        {
+            (
+                (1_000_000.0 / mhz as f64) as f32,
+                "winit (compositor-reported)",
+            )
+        } else {
+            (1000.0 / 60.0, "fallback default, 60 Hz ASSUMED")
+        };
+
+        // `VRR_ENABLED` on the connector's CRTC (None when unknown).
+        let drm_vrr: Option<bool> = args
+            .connector
+            .as_deref()
+            .and_then(|name| drm_info.as_ref()?.find_vrr_enabled(name));
 
         // Used to seed `prev_cpu_frame_ms` to a reasonable non-zero value before
         // the first real frame measurement is available.
         let ideal_period_ns_init = frame_budget_ms as f64 * 1_000_000.0;
 
         println!(
-            "Frame Budget: {:.4}ms ({:.2}Hz)  ",
+            "Frame Budget: {:.4}ms ({:.3}Hz)  source: {}",
             frame_budget_ms,
             1000.0 / frame_budget_ms,
+            refresh_source,
         );
+
+        // A variable-refresh output has no fixed vblank period, so the fixed
+        // budget behind vblank_mul / phase drift / sync_score is not meaningful.
+        if drm_vrr == Some(true) {
+            if args.bench_secs.is_some() {
+                eprintln!(
+                    "Error: VRR is enabled on the target output; the fixed vblank grid used \
+                     by --bench-secs is invalid under variable refresh. Disable VRR for this \
+                     connector and retry."
+                );
+                std::process::exit(1);
+            }
+            eprintln!(
+                "WARN: VRR is enabled on the target output; vblank_mul, phase drift and \
+                 sync_score assume a fixed refresh period and are NOT reliable."
+            );
+        }
 
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
         let adapter = instance
@@ -242,18 +299,23 @@ impl<'a> State<'a> {
         // Warn once if the backend does not support WSI-domain timestamps.
         // In that case jitter/FTV fall back to CPU Instant deltas, which are
         // schedulable by compositor tricks such as max_render_time.
-        let hw_timestamps_available = {
-            let ts = adapter.get_presentation_timestamp();
-            if ts.is_invalid() {
-                eprintln!(
-                    "WARN: Backend does not support presentation timestamps, \
-                     jitter/FTV will use CPU timers (compositor-schedulable)"
-                );
-                false
-            } else {
-                println!("Presentation timestamps: available (WSI-domain, compositor-resistant)");
-                true
-            }
+        let wp = WpPresentation::new(&window);
+        let hw_timestamps_available = if wp.is_some() {
+            println!(
+                "Presentation timestamps: wp_presentation bound; scanout accuracy \
+                 (HW_CLOCK) is verified on the first feedback"
+            );
+            true
+        } else {
+            // `adapter.get_presentation_timestamp()` is only a clock read taken
+            // after present(): a CPU timestamp, not a scanout time. It is
+            // deliberately not used as a substitute.
+            eprintln!(
+                "WARN: wp_presentation unavailable (not Wayland, or protocol/clock \
+                 unsupported): no scanout timestamps. jitter/FTV use CPU timers \
+                 (compositor-schedulable) and --frame-log is disabled."
+            );
+            false
         };
 
         let gpu_timer = GpuTimer::new(&device, &queue);
@@ -283,8 +345,12 @@ impl<'a> State<'a> {
                         None => "",
                     };
                     raw_header.push_str(&format!(
-                        "{}: {}x{} @ {}Hz{}\n",
-                        c.name, m.width, m.height, m.refresh_hz, vrr
+                        "{}: {}x{} @ {:.3}Hz{}\n",
+                        c.name,
+                        m.width,
+                        m.height,
+                        m.refresh_mhz as f64 / 1000.0,
+                        vrr
                     ));
                 }
             }
@@ -330,7 +396,7 @@ impl<'a> State<'a> {
                 .unwrap()
         });
 
-        // Only open the frame log when the backend can supply hardware timestamps;
+        // Only open the frame log when the backend can supply hardware timestamps,
         // silently skip it otherwise to avoid writing a file full of CPU-derived
         // data that would be misleading under the per-frame pacing contract.
         let frame_log_file = args.frame_log.as_ref().and_then(|path| {
@@ -350,7 +416,7 @@ impl<'a> State<'a> {
             Some(f)
         });
 
-        // In benchmark mode the initial cube count is always 1; the machine
+        // In benchmark mode the initial cube count is always 1, the machine
         // drives `current_cubes` forward from there.
         let initial_cube_count = if args.bench_secs.is_some() {
             1
@@ -462,7 +528,6 @@ impl<'a> State<'a> {
             queue,
             config,
             window,
-            adapter,
             render_pipeline,
             uniform_binding,
             start_time: now,
@@ -484,6 +549,8 @@ impl<'a> State<'a> {
             gpu_timer,
             gpu_tier,
             last_micro_vblank_mul: 0,
+            drm_vrr,
+            refresh_verified: false,
             flip_tracker,
             gpu_end_ns: None,
             flip_tracker_warned: false,
@@ -491,6 +558,73 @@ impl<'a> State<'a> {
             prev_cpu_frame_ms: (ideal_period_ns_init * 0.5 / 1_000_000.0) as f32,
             pll,
             pll_diag: None,
+            wp,
+            wp_pending: VecDeque::new(),
+            wp_vsync_ns: None,
+            wp_clock_reported: false,
+        }
+    }
+
+    /// One-shot cross-check of the startup refresh rate against the `refresh`
+    /// the compositor reports (via `wp_presentation`) for the output this surface
+    /// is actually on.
+    ///
+    /// The grid is deliberately not re-tuned mid-run: changing the period after
+    /// samples were taken would split the dataset. A disagreement is reported, and
+    /// in `--bench-secs` mode it aborts, because a wrong period makes `vblank_mul`
+    /// and every phase metric meaningless.
+    fn verify_refresh(&mut self) {
+        // Relative disagreement above which the grid is considered wrong
+        // (60 vs 59.94 Hz is 0.1%, so it is caught).
+        const REFRESH_TOLERANCE: f64 = 0.0005;
+
+        if self.refresh_verified {
+            return;
+        }
+        let Some(refresh_ns) = self.wp.as_ref().and_then(|w| w.last_refresh_ns()) else {
+            return;
+        };
+        self.refresh_verified = true;
+        let bench = self.args.bench_secs.is_some();
+        let budget_ms = self.metrics.frame_budget_ms as f64;
+
+        if refresh_ns == 0 {
+            eprintln!(
+                "WARN: compositor reports refresh=0 (variable refresh or unknown period) for \
+                 this output; the fixed vblank grid cannot be cross-checked."
+            );
+            // DRM explicitly saying VRR is off means 0 is just "unknown": warn only.
+            if bench && self.drm_vrr != Some(false) {
+                eprintln!(
+                    "Error: refusing --bench-secs on an output with unknown/variable refresh. \
+                     Disable VRR, or pass --connector so DRM can confirm it is off."
+                );
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        let wp_ms = refresh_ns as f64 / 1_000_000.0;
+        let rel = (wp_ms - budget_ms).abs() / wp_ms;
+        if rel > REFRESH_TOLERANCE {
+            eprintln!(
+                "WARN: refresh mismatch: using {:.4}ms ({:.3}Hz) but the compositor reports \
+                 {:.4}ms ({:.3}Hz) for this output. Phase drift, vblank_mul and sync_score \
+                 will be wrong. Pass --connector for the output the window is on.",
+                budget_ms,
+                1000.0 / budget_ms,
+                wp_ms,
+                1000.0 / wp_ms,
+            );
+            if bench {
+                eprintln!("Error: refusing --bench-secs with a mismatched refresh period.");
+                std::process::exit(1);
+            }
+        } else {
+            println!(
+                "Refresh check:           compositor reports {:.3}Hz, matches frame budget",
+                1000.0 / wp_ms
+            );
         }
     }
 
@@ -510,6 +644,7 @@ impl<'a> State<'a> {
             .as_secs_f32()
             * 1000.0;
         self.last_frame_time = frame_start;
+        self.verify_refresh();
 
         // RED  (stutter_decay):  severe regime, EMA(vblank_mul) > 1.15.
         //   Lingers ~45 frames so a bad run leaves a long-lasting red ghost.
@@ -526,7 +661,7 @@ impl<'a> State<'a> {
         // clearly degraded regime without penalising isolated one-off drops.
         const PACING_EMA_THRESHOLD: f32 = 1.15;
 
-        // Decay both markers unconditionally; trigger paths only set them to 1.0.
+        // Decay both markers unconditionally, trigger paths only set them to 1.0.
         // stutter_decay (red) is set in the HW pacing block below on EMA breach,
         // or in the CPU fallback on threshold breach.
         // pacing_decay (yellow) is set on any single vblank_mul > 1.
@@ -537,7 +672,7 @@ impl<'a> State<'a> {
         // Flush pending wgpu callbacks (including the map_async completion for the
         // previous frame's timestamp readback) before draining the gpu_timer state
         // machine. With latency=1 the swapchain does not block long enough for the
-        // Vulkan driver to fire the callback on its own; a non-blocking Poll here
+        // Vulkan driver to fire the callback on its own, a non-blocking Poll here
         // guarantees the Mapped state is visible to gpu_timer.poll() below without
         // stalling the CPU.
         let _ = self.device.poll(wgpu::PollType::Poll);
@@ -584,7 +719,8 @@ impl<'a> State<'a> {
 
         // Hardware vblank timestamp forwarded to PacingAnalyzer and PllController
         // to anchor their phase grids.  `None` when FlipTracker is inactive.
-        let hw_vblank_ns: Option<u64> = flip_record.as_ref().map(|r| r.flip_ns);
+        let hw_vblank_ns: Option<u64> =
+            flip_record.as_ref().map(|r| r.flip_ns).or(self.wp_vsync_ns);
 
         let flip_latency_ms: Option<f32> =
             flip_record
@@ -643,7 +779,7 @@ impl<'a> State<'a> {
         // Acquire the next swapchain image, handling every outcome explicitly.
         //
         // `Suboptimal` still carries a valid texture and is rendered into so the
-        // frame metrics pipeline does not see a spurious dropped frame; the surface
+        // frame metrics pipeline does not see a spurious dropped frame, the surface
         // is reconfigured after `present()` so the submission pipeline is not
         // interrupted mid-flight.
         //
@@ -715,6 +851,8 @@ impl<'a> State<'a> {
         // the value is in the same nanosecond epoch as WSI presentation timestamps
         // without any anchor arithmetic or accumulated error.
         let cpu_submit_ns = clock_monotonic_ns();
+        // Feedback must be requested before the commit that present() performs.
+        let wp_token = self.wp.as_mut().map(|w| w.request_feedback());
         output.present();
         // Deferred reconfigure: surface was `Suboptimal` on this frame's acquire.
         // Reconfiguring after `present()` ensures the submitted command buffer
@@ -726,141 +864,209 @@ impl<'a> State<'a> {
         let cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         self.prev_cpu_frame_ms = cpu_frame_ms;
 
-        let mut pacing_record = None;
+        let this_submit = SubmitInfo {
+            cpu_frame_ms,
+            cpu_submit_ns,
+            gpu_time_ms,
+            micro,
+            flip_latency_ms,
+        };
 
-        // Sample the WSI clock after present(). On DRM/KMS+Vulkan backends this
-        // is CLOCK_MONOTONIC nanoseconds from the presentation engine, the same
-        // domain as vblank timestamps. Computing deltas between consecutive samples
-        // gives inter-frame intervals that compositor scheduling (max_render_time,
-        // frame callbacks) cannot fabricate, because the clock ticks independently
-        // of any Wayland protocol messages.
-        //
-        // On backends that return is_invalid() (OpenGL, some Vulkan ICDs without
-        // VK_EXT_calibrated_timestamps) we fall back to CPU Instant deltas, which
-        // ARE schedulable. The `hw_verified` flag in TickStats exposes which path ran.
-        //
-        //FIXME: To get true, microsecond-accurate frame pacing, we need hardware-level presentation timestamps
-        // In Fifo the driver absorbs the vsync wait internally before returning from get_current_texture(), so our CPU timer is ~0ms.
-        // hardware timestamps would also improve Immediate/Mailbox precision.
-        // https://docs.rs/wgpu/latest/wgpu/struct.PresentationTimestamp.html
-        let wsi_delta_ms: Option<f32> = {
-            let ts = self.adapter.get_presentation_timestamp();
-            if ts.is_invalid() {
-                self.last_pres_ts = None;
-                // No HW timestamps: threshold breach is the only coarse proxy available.
-                // Maps to red (severe) since a 25ms+ stall is always a hard hitch.
-                if total_frame_delta > self.args.threshold {
-                    self.stutter_decay = 1.0;
-                }
-                None
-            } else {
-                let now_ns = ts.0 as u64;
-                let delta = self.last_pres_ts.map(|prev| {
-                    // nanoseconds → milliseconds; saturating_sub guards against
-                    // monotonic clock resets on suspend/resume cycles.
-                    now_ns.saturating_sub(prev) as f32 / 1_000_000.0
-                });
-                self.last_pres_ts = Some(now_ns);
-
-                // Compute a raw vblank multiplier directly from the WSI delta
-                // before feeding it into the pacing analyzer. The analyzer may
-                // discard this frame (first frame, clock discontinuity, or
-                // delta > 3×ideal_ms on a severe GPU overrun), but the micro-
-                // stutter diagnosis must fire unconditionally on any missed vblank.
-                let ideal_ms = self.metrics.frame_budget_ms;
-                let raw_vblank_mul = if let Some(d) = delta {
-                    if d > ideal_ms * 1.25 {
-                        (d / ideal_ms).round() as u32
-                    } else {
-                        1
+        // Presentation samples to ingest this frame: (presented_ns, submit data,
+        // vsync-flag). These are compositor-reported scanout times (HW_CLOCK) for
+        // earlier submits (0..n per call), empty when wp_presentation is absent.
+        let wp_active = self.wp.is_some();
+        let mut samples: Vec<(u64, SubmitInfo, bool)> = Vec::new();
+        if let Some(token) = wp_token {
+            self.wp_pending.push_back((token, this_submit));
+            while self.wp_pending.len() > 64 {
+                self.wp_pending.pop_front();
+            }
+        }
+        if let Some(wp) = self.wp.as_mut() {
+            for ev in wp.poll() {
+                match ev {
+                    PresentEvent::Presented {
+                        token,
+                        present_ns,
+                        flags,
+                        ..
+                    } => {
+                        while let Some((t, info)) = self.wp_pending.pop_front() {
+                            if t != token {
+                                continue;
+                            }
+                            let hw_clock = flags & WP_FLAG_HW_CLOCK != 0;
+                            if !self.wp_clock_reported {
+                                self.wp_clock_reported = true;
+                                if hw_clock {
+                                    println!(
+                                        "wp_presentation clock:   HW_CLOCK set (kernel \
+                                         page-flip time, true scanout)"
+                                    );
+                                } else if self.args.allow_sw_timestamps {
+                                    eprintln!(
+                                        "WARN: compositor did not set HW_CLOCK; timestamps \
+                                         are software-sampled and include compositor CPU \
+                                         jitter (--allow-sw-timestamps)."
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "WARN: compositor did not set HW_CLOCK; its \
+                                         timestamps are software-sampled, not scanout \
+                                         times. Discarding them (no pacing data). Pass \
+                                         --allow-sw-timestamps to use them anyway."
+                                    );
+                                }
+                            }
+                            if hw_clock || self.args.allow_sw_timestamps {
+                                let vsync = hw_clock && flags & WP_FLAG_VSYNC != 0;
+                                samples.push((present_ns, info, vsync));
+                            } else {
+                                // Break the delta chain so no interval spans a gap.
+                                self.last_pres_ts = None;
+                            }
+                            break;
+                        }
                     }
+                    PresentEvent::Discarded { token } => {
+                        self.wp_pending.retain(|(t, _)| *t != token);
+                    }
+                }
+            }
+        } else {
+            // No scanout timestamps exist without wp_presentation, a clock read
+            // after present() would be a CPU timestamp, so none is fabricated.
+            // Threshold breach is the only coarse proxy available.
+            self.last_pres_ts = None;
+            if total_frame_delta > self.args.threshold {
+                self.stutter_decay = 1.0;
+            }
+        }
+
+        let mut wsi_delta_ms: Option<f32> = None;
+        let mut pacing_record = None;
+        for (now_ns, sub, vsync) in samples {
+            // A VSYNC-flagged presentation time is a true vblank edge.
+            let anchor = vsync.then_some(now_ns).or(hw_vblank_ns);
+            if vsync {
+                self.wp_vsync_ns = Some(now_ns);
+            }
+            let delta = self.last_pres_ts.map(|prev| {
+                // nanoseconds → milliseconds, saturating_sub guards against
+                // monotonic clock resets on suspend/resume cycles.
+                now_ns.saturating_sub(prev) as f32 / 1_000_000.0
+            });
+            self.last_pres_ts = Some(now_ns);
+
+            // Compute a raw vblank multiplier directly from the WSI delta
+            // before feeding it into the pacing analyzer. The analyzer may
+            // discard this frame (first frame, clock discontinuity, or
+            // delta > 3×ideal_ms on a severe GPU overrun), but the micro-
+            // stutter diagnosis must fire unconditionally on any missed vblank.
+            let ideal_ms = self.metrics.frame_budget_ms;
+            let raw_vblank_mul = if let Some(d) = delta {
+                if d > ideal_ms * 1.25 {
+                    (d / ideal_ms).round() as u32
                 } else {
                     1
-                };
-
-                // Suppress [MICRO] output for the first 3 seconds after startup.
-                // The outer GPU timer lags one frame on cold start so shader_ms
-                // reads 0.00ms, producing misleading DRIVER STALL labels that are
-                // purely an artefact of the readback pipeline warming up.
-                const MICRO_WARMUP_SECS: f32 = 3.0;
-
-                if raw_vblank_mul > 1 {
-                    if let Some(m) = micro {
-                        let elapsed = self.start_time.elapsed().as_secs_f32();
-                        // Print only when vblank_mul changes value: suppresses the
-                        // duplicate that appears when two consecutive WSI deltas both
-                        // reflect the same overrun (overrun frame + recovery frame).
-                        if elapsed >= MICRO_WARMUP_SECS
-                            && raw_vblank_mul != self.last_micro_vblank_mul
-                        {
-                            let cause = if m.driver_overhead_ms > 2.0 {
-                                "DRIVER STALL"
-                            } else if m.resolve_ms > 0.3 {
-                                "RESOLVE/DMA SPIKE"
-                            } else {
-                                "SHADER OVERRUN"
-                            };
-                            eprintln!(
-                                "[MICRO] vblank×{} — {} \
-                                 (driver {:.2}ms  shader {:.2}ms  resolve {:.2}ms  total {:.2}ms)",
-                                raw_vblank_mul,
-                                cause,
-                                m.driver_overhead_ms,
-                                m.shader_ms,
-                                m.resolve_ms,
-                                m.total_ms,
-                            );
-                        }
-                        self.last_micro_vblank_mul = raw_vblank_mul;
-                    }
-                } else {
-                    self.last_micro_vblank_mul = 0;
                 }
+            } else {
+                1
+            };
 
-                // Feed the raw timestamp into the pacing analyzer before the
-                // 500ms tick gate so every individual frame's phase drift and
-                // sync score are captured and logged at full frame resolution.
-                pacing_record = self.pacing.push(
-                    now_ns,
-                    hw_vblank_ns,
-                    Some(cpu_frame_ms),
-                    Some(cpu_submit_ns),
-                    gpu_time_ms,
-                    micro,
-                    flip_latency_ms,
+            // Suppress [MICRO] output for the first 3 seconds after startup.
+            // The outer GPU timer lags one frame on cold start so shader_ms
+            // reads 0.00ms, producing misleading DRIVER STALL labels that are
+            // purely an artefact of the readback pipeline warming up.
+            const MICRO_WARMUP_SECS: f32 = 3.0;
+
+            if raw_vblank_mul > 1 {
+                if let Some(m) = sub.micro {
+                    let elapsed = self.start_time.elapsed().as_secs_f32();
+                    // Print only when vblank_mul changes value: suppresses the
+                    // duplicate that appears when two consecutive WSI deltas both
+                    // reflect the same overrun (overrun frame + recovery frame).
+                    if elapsed >= MICRO_WARMUP_SECS && raw_vblank_mul != self.last_micro_vblank_mul
+                    {
+                        let cause = if m.driver_overhead_ms > 2.0 {
+                            "DRIVER STALL"
+                        } else if m.resolve_ms > 0.3 {
+                            "RESOLVE/DMA SPIKE"
+                        } else {
+                            "SHADER OVERRUN"
+                        };
+                        eprintln!(
+                            "[MICRO] vblank×{} - {} \
+                             (driver {:.2}ms  shader {:.2}ms  resolve {:.2}ms  total {:.2}ms)",
+                            raw_vblank_mul,
+                            cause,
+                            m.driver_overhead_ms,
+                            m.shader_ms,
+                            m.resolve_ms,
+                            m.total_ms,
+                        );
+                    }
+                    self.last_micro_vblank_mul = raw_vblank_mul;
+                }
+            } else {
+                self.last_micro_vblank_mul = 0;
+            }
+
+            // Feed the raw timestamp into the pacing analyzer before the
+            // 500ms tick gate so every individual frame's phase drift and
+            // sync score are captured and logged at full frame resolution.
+            let mut rec = self.pacing.push(
+                now_ns,
+                anchor,
+                Some(sub.cpu_frame_ms),
+                Some(sub.cpu_submit_ns),
+                sub.gpu_time_ms,
+                sub.micro,
+                sub.flip_latency_ms,
+            );
+
+            // `push()` pairs slack with the *previous* submit, with feedback
+            // arriving per-frame the matching submit is known exactly.
+            if wp_active {
+                if let Some(r) = rec.as_mut() {
+                    let gap = now_ns.saturating_sub(sub.cpu_submit_ns) as f32 / 1_000_000.0;
+                    r.slack_ms = (gap > 0.0 && gap < r.ideal_ms * 5.0).then_some(gap);
+                }
+            }
+
+            if let Some(record) = &rec {
+                if let Some(s) = record.slack_ms {
+                    self.slack_ms = s;
+                }
+                let live_cube_count = self
+                    .benchmark
+                    .as_ref()
+                    .map_or(self.args.cubes, |b| b.current_cubes);
+                write_frame_log_row(
+                    &mut self.frame_log_file,
+                    record,
+                    live_cube_count,
+                    self.pll_diag.as_ref(),
                 );
 
-                if let Some(record) = &pacing_record {
-                    if let Some(s) = record.slack_ms {
-                        self.slack_ms = s;
-                    }
-                    let live_cube_count = self
-                        .benchmark
-                        .as_ref()
-                        .map_or(self.args.cubes, |b| b.current_cubes);
-                    write_frame_log_row(
-                        &mut self.frame_log_file,
-                        record,
-                        live_cube_count,
-                        self.pll_diag.as_ref(),
-                    );
-
-                    if record.vblank_mul > 1 {
-                        self.pacing_decay = 1.0;
-                        self.any_vblank_miss_this_frame = true;
-                    }
-
-                    // EMA breach is the severe regime, fire red and let it linger.
-                    self.vblank_mul_ema = PACING_EMA_ALPHA * record.vblank_mul as f32
-                        + (1.0 - PACING_EMA_ALPHA) * self.vblank_mul_ema;
-                    if self.vblank_mul_ema > PACING_EMA_THRESHOLD {
-                        self.stutter_decay = 1.0;
-                    }
+                if record.vblank_mul > 1 {
+                    self.pacing_decay = 1.0;
+                    self.any_vblank_miss_this_frame = true;
                 }
 
-                delta.filter(|&ms| ms > 0.0 && ms < 1000.0)
+                // EMA breach is the severe regime, fire red and let it linger.
+                self.vblank_mul_ema = PACING_EMA_ALPHA * record.vblank_mul as f32
+                    + (1.0 - PACING_EMA_ALPHA) * self.vblank_mul_ema;
+                if self.vblank_mul_ema > PACING_EMA_THRESHOLD {
+                    self.stutter_decay = 1.0;
+                }
             }
-        };
+
+            pacing_record = rec;
+
+            wsi_delta_ms = delta.filter(|&ms| ms > 0.0 && ms < 1000.0);
+        }
 
         let presentation_ts: Option<u64> = self.last_pres_ts.filter(|_| wsi_delta_ms.is_some());
 
@@ -883,7 +1089,7 @@ impl<'a> State<'a> {
             write_csv_row(&mut self.csv_file, &stats);
             write_json_row(&mut self.json_file, &stats);
 
-            // In benchmark mode the cube count may have been updated mid-step;
+            // In benchmark mode the cube count may have been updated mid-step,
             // always read from the state machine so the uniform stays in sync.
             let live_cube_count = self
                 .benchmark

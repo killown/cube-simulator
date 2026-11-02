@@ -116,9 +116,15 @@ pub struct Args {
     /// # Frame log fields added
     ///
     /// When `--frame-log` is also passed, each row gains three new fields:
-    /// - `pll_error_ns` — phase error fed into this frame's PI iteration
-    /// - `pll_sleep_ns` — sleep duration actually issued (0 when locked / early)
-    /// - `pll_lock`     — `1` when the controller is in Locked tracking mode
+    /// - `pll_error_ns` - phase error fed into this frame's PI iteration
+    /// - `pll_sleep_ns` - sleep duration actually issued (0 when locked / early)
+    /// - `pll_lock`     - `1` when the controller is in Locked tracking mode
     #[arg(long, default_value_t = false)]
     pub pll: bool,
+    /// Accept `wp_presentation` timestamps that the compositor did not flag
+    /// `HW_CLOCK` (i.e. read from a software clock, not the kernel's page-flip
+    /// time). These include compositor CPU scheduling jitter and are NOT scanout
+    /// times, by default they are discarded and the run reports no pacing data.
+    #[arg(long, default_value_t = false)]
+    pub allow_sw_timestamps: bool,
 }
