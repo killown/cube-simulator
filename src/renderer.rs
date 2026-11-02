@@ -137,6 +137,10 @@ pub struct State<'a> {
     wp_vsync_ns: Option<u64>,
     /// Set once the first feedback's clock quality (`HW_CLOCK`) has been reported.
     wp_clock_reported: bool,
+    /// Consecutive frames with no `wp_presentation` feedback while a request was
+    /// outstanding.  Used to detect compositor restarts that silently stop
+    /// delivering scanout timestamps.
+    wp_starved_frames: u32,
 }
 
 /// Returns the current `CLOCK_MONOTONIC` time in nanoseconds via a direct libc
@@ -484,7 +488,7 @@ impl<'a> State<'a> {
             let tracker = FlipTracker::new(&info.dev_path, crtc);
             if tracker.is_some() {
                 println!(
-                    "Flip tracker:            active  (DRM_EVENT_FLIP_COMPLETE, CLOCK_MONOTONIC)"
+                    "Flip tracker:            active  (DRM_EVENT_CRTC_SEQUENCE, CLOCK_MONOTONIC)"
                 );
             } else {
                 eprintln!(
@@ -562,6 +566,7 @@ impl<'a> State<'a> {
             wp_pending: VecDeque::new(),
             wp_vsync_ns: None,
             wp_clock_reported: false,
+            wp_starved_frames: 0,
         }
     }
 
@@ -877,14 +882,32 @@ impl<'a> State<'a> {
         // earlier submits (0..n per call), empty when wp_presentation is absent.
         let wp_active = self.wp.is_some();
         let mut samples: Vec<(u64, SubmitInfo, bool)> = Vec::new();
+        let mut pending_evicted = false;
         if let Some(token) = wp_token {
             self.wp_pending.push_back((token, this_submit));
             while self.wp_pending.len() > 64 {
                 self.wp_pending.pop_front();
+                pending_evicted = true;
             }
         }
+        if pending_evicted {
+            self.last_pres_ts = None;
+        }
         if let Some(wp) = self.wp.as_mut() {
-            for ev in wp.poll() {
+            let events = wp.poll();
+            if events.is_empty() && wp_token.is_some() {
+                self.wp_starved_frames = self.wp_starved_frames.saturating_add(1);
+                if self.wp_starved_frames == 240 && self.args.bench_secs.is_some() {
+                    eprintln!(
+                        "WARN: no wp_presentation feedback for 240 frames; compositor \
+                         likely restarted. Benchmark results after this point are not \
+                         hardware-timed."
+                    );
+                }
+            } else {
+                self.wp_starved_frames = 0;
+            }
+            for ev in events {
                 match ev {
                     PresentEvent::Presented {
                         token,
@@ -892,45 +915,55 @@ impl<'a> State<'a> {
                         flags,
                         ..
                     } => {
+                        let mut matched = None;
                         while let Some((t, info)) = self.wp_pending.pop_front() {
-                            if t != token {
-                                continue;
+                            if t == token {
+                                matched = Some(info);
+                                break;
                             }
-                            let hw_clock = flags & WP_FLAG_HW_CLOCK != 0;
-                            if !self.wp_clock_reported {
-                                self.wp_clock_reported = true;
-                                if hw_clock {
-                                    println!(
-                                        "wp_presentation clock:   HW_CLOCK set (kernel \
-                                         page-flip time, true scanout)"
-                                    );
-                                } else if self.args.allow_sw_timestamps {
-                                    eprintln!(
-                                        "WARN: compositor did not set HW_CLOCK; timestamps \
-                                         are software-sampled and include compositor CPU \
-                                         jitter (--allow-sw-timestamps)."
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "WARN: compositor did not set HW_CLOCK; its \
-                                         timestamps are software-sampled, not scanout \
-                                         times. Discarding them (no pacing data). Pass \
-                                         --allow-sw-timestamps to use them anyway."
-                                    );
-                                }
-                            }
-                            if hw_clock || self.args.allow_sw_timestamps {
-                                let vsync = hw_clock && flags & WP_FLAG_VSYNC != 0;
-                                samples.push((present_ns, info, vsync));
+                            self.last_pres_ts = None;
+                        }
+                        let Some(info) = matched else {
+                            self.last_pres_ts = None;
+                            continue;
+                        };
+                        let hw_clock = flags & WP_FLAG_HW_CLOCK != 0;
+                        if !self.wp_clock_reported {
+                            self.wp_clock_reported = true;
+                            if hw_clock {
+                                println!(
+                                    "wp_presentation clock:   HW_CLOCK set (kernel \
+                                     page-flip time, true scanout)"
+                                );
+                            } else if self.args.allow_sw_timestamps {
+                                eprintln!(
+                                    "WARN: compositor did not set HW_CLOCK; timestamps \
+                                     are software-sampled and include compositor CPU \
+                                     jitter (--allow-sw-timestamps)."
+                                );
                             } else {
-                                // Break the delta chain so no interval spans a gap.
-                                self.last_pres_ts = None;
+                                eprintln!(
+                                    "WARN: compositor did not set HW_CLOCK; its \
+                                     timestamps are software-sampled, not scanout \
+                                     times. Discarding them (no pacing data). Pass \
+                                     --allow-sw-timestamps to use them anyway."
+                                );
                             }
-                            break;
+                        }
+                        if hw_clock || self.args.allow_sw_timestamps {
+                            let vsync = hw_clock && flags & WP_FLAG_VSYNC != 0;
+                            samples.push((present_ns, info, vsync));
+                        } else {
+                            // Break the delta chain so no interval spans a gap.
+                            self.last_pres_ts = None;
                         }
                     }
                     PresentEvent::Discarded { token } => {
+                        let before = self.wp_pending.len();
                         self.wp_pending.retain(|(t, _)| *t != token);
+                        if self.wp_pending.len() != before {
+                            self.last_pres_ts = None;
+                        }
                     }
                 }
             }
@@ -944,8 +977,10 @@ impl<'a> State<'a> {
             }
         }
 
+        let samples_empty = samples.is_empty();
         let mut wsi_delta_ms: Option<f32> = None;
         let mut pacing_record = None;
+        let mut sample_miss = false;
         for (now_ns, sub, vsync) in samples {
             // A VSYNC-flagged presentation time is a true vblank edge.
             let anchor = vsync.then_some(now_ns).or(hw_vblank_ns);
@@ -1035,6 +1070,10 @@ impl<'a> State<'a> {
                 }
             }
 
+            if raw_vblank_mul > 1 {
+                sample_miss = true;
+            }
+
             if let Some(record) = &rec {
                 if let Some(s) = record.slack_ms {
                     self.slack_ms = s;
@@ -1054,18 +1093,24 @@ impl<'a> State<'a> {
                     self.pacing_decay = 1.0;
                     self.any_vblank_miss_this_frame = true;
                 }
-
-                // EMA breach is the severe regime, fire red and let it linger.
-                self.vblank_mul_ema = PACING_EMA_ALPHA * record.vblank_mul as f32
-                    + (1.0 - PACING_EMA_ALPHA) * self.vblank_mul_ema;
-                if self.vblank_mul_ema > PACING_EMA_THRESHOLD {
-                    self.stutter_decay = 1.0;
-                }
             }
 
-            pacing_record = rec;
+            self.vblank_mul_ema = PACING_EMA_ALPHA * raw_vblank_mul as f32
+                + (1.0 - PACING_EMA_ALPHA) * self.vblank_mul_ema;
+            if self.vblank_mul_ema > PACING_EMA_THRESHOLD {
+                self.stutter_decay = 1.0;
+            }
+
+            if rec.is_some() {
+                pacing_record = rec;
+            }
 
             wsi_delta_ms = delta.filter(|&ms| ms > 0.0 && ms < 1000.0);
+        }
+
+        if sample_miss {
+            self.pacing_decay = 1.0;
+            self.any_vblank_miss_this_frame = true;
         }
 
         let presentation_ts: Option<u64> = self.last_pres_ts.filter(|_| wsi_delta_ms.is_some());
@@ -1126,16 +1171,43 @@ impl<'a> State<'a> {
         // Runs after the uniforms are updated so the last frame of a step still
         // renders the correct cube count before the machine advances.
         if let Some(bench) = self.benchmark.as_mut() {
+            let was_measuring = bench.is_measuring();
+            let prev_cubes = bench.current_cubes;
+            let miss_for_tick = if samples_empty {
+                false
+            } else {
+                self.any_vblank_miss_this_frame
+            };
+            let pacing_for_tick = if samples_empty {
+                0.0
+            } else {
+                self.pacing_decay
+            };
+            let stutter_for_tick = if samples_empty {
+                0.0
+            } else {
+                self.stutter_decay
+            };
             let just_done = bench.tick(
-                self.pacing_decay,
-                self.stutter_decay,
+                pacing_for_tick,
+                stutter_for_tick,
                 self.vblank_mul_ema,
-                self.any_vblank_miss_this_frame,
+                miss_for_tick,
             );
 
             if just_done {
                 self.benchmark_done = true;
             } else {
+                // Step boundary crossed: discard pressure state that belonged
+                // to the previous cube count, otherwise a red/yellow pulse at
+                // the tail of step N fires the trigger on the first measured
+                // frame of step N+1 before any of its own data exists.
+                if bench.current_cubes != prev_cubes {
+                    self.pacing_decay = 0.0;
+                    self.stutter_decay = 0.0;
+                    self.vblank_mul_ema = 1.0;
+                    self.last_micro_vblank_mul = 0;
+                }
                 // Hot-patch the cube count in the live uniform without waiting
                 // for the next 500ms metrics tick.
                 let new_count = bench.current_cubes;
@@ -1151,11 +1223,7 @@ impl<'a> State<'a> {
                 // strictly proportional to cube_count.  The high-end SDF loop
                 // is position-invariant so freezing is not needed there.
                 if self.gpu_tier == GpuTier::LowEnd {
-                    let target_speed = if bench.is_measuring() {
-                        0.0
-                    } else {
-                        self.args.speed
-                    };
+                    let target_speed = if was_measuring { 0.0 } else { self.args.speed };
                     if self.current_uniforms.speed != target_speed {
                         self.current_uniforms.speed = target_speed;
                         self.uniform_binding

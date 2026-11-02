@@ -51,7 +51,7 @@ pub struct BenchScore {
     pub total: u32,
     /// Points contributed by clean-pass cube counts.
     pub clean_points: u32,
-    /// Points contributed by the trigger event (0 on a perfect sweep).
+    /// Penalty attributed to the trigger event (0 on a perfect sweep).
     pub trigger_points: u32,
     /// Flat bonus awarded only when the sweep completes without any trigger.
     pub perfect_bonus: u32,
@@ -73,7 +73,7 @@ const PERFECT_BONUS: u32 = 500;
 impl BenchScore {
     /// Computes the score from the completed result set.
     ///
-    /// `results` must be the final slice from [`BenchmarkState`]; the last
+    /// `results` must be the final slice from [`BenchmarkState`], the last
     /// entry may or may not carry a trigger.
     pub(crate) fn compute(results: &[BenchStepResult]) -> Self {
         let clean_cubes = results.iter().take_while(|r| r.trigger.is_none()).count() as u32;
@@ -89,11 +89,12 @@ impl BenchScore {
                     BenchTrigger::Yellow => YELLOW_TRIGGER_MULTIPLIER,
                     BenchTrigger::Red => RED_TRIGGER_MULTIPLIER,
                 };
-                (r.cube_count * mult, 0, Some((r.cube_count, t)))
+                let penalty = r.cube_count * mult;
+                (penalty.min(clean_points), 0, Some((r.cube_count, t)))
             }
         };
 
-        let total = clean_points + trigger_points + perfect_bonus;
+        let total = clean_points + perfect_bonus;
 
         Self {
             total,
@@ -107,12 +108,17 @@ impl BenchScore {
 
     /// Returns a short letter grade that maps score ranges to an intuitive
     /// tier label, useful for quick cross-machine comparisons.
-    fn grade(&self) -> &'static str {
-        match self.total {
-            4500.. => "S",
-            3000..=4499 => "A",
-            1500..=2999 => "B",
-            500..=1499 => "C",
+    fn grade(&self, bench_max: u32) -> &'static str {
+        let norm = if bench_max == 0 {
+            0.0
+        } else {
+            self.total as f32 / ((bench_max * POINTS_PER_CLEAN_CUBE) as f32 + PERFECT_BONUS as f32)
+        };
+        match norm {
+            n if n >= 0.95 => "S",
+            n if n >= 0.75 => "A",
+            n if n >= 0.50 => "B",
+            n if n >= 0.25 => "C",
             _ => "D",
         }
     }
@@ -156,6 +162,11 @@ pub struct BenchmarkState {
     /// Set once we have a terminal result (trigger fired or sweep complete).
     done: bool,
 }
+
+/// Minimum measurement-window duration, in seconds, required before a clean
+/// pass is credited. Below this the step has essentially no samples and is
+/// recorded as inconclusive (no trigger, no clean credit).
+const MIN_MEASURED_SECS: f32 = 0.5;
 
 impl BenchmarkState {
     /// Creates a new benchmark starting at 1 cube.
@@ -245,7 +256,14 @@ impl BenchmarkState {
 
             // Step timer expired, clean pass for this cube count.
             if step_elapsed >= self.step_secs as f64 {
-                self.record_step(measured_secs, None);
+                if measured_secs < MIN_MEASURED_SECS {
+                    eprintln!(
+                        "[BENCH] {} cubes - inconclusive (only {:.2}s measured, minimum {:.2}s)",
+                        self.current_cubes, measured_secs, MIN_MEASURED_SECS
+                    );
+                } else {
+                    self.record_step(measured_secs, None);
+                }
 
                 if self.current_cubes >= self.max_cubes {
                     // Entire sweep completed without a trigger.
@@ -291,7 +309,7 @@ impl BenchmarkState {
 
     /// Returns `true` when the current step is in the measurement window.
     ///
-    /// During warmup this returns `false`; transitions to `true` once the
+    /// During warmup this returns `false`, transitions to `true` once the
     /// warmup period elapses.  The renderer uses this to freeze animation
     /// (`speed = 0`) on the low-end shader so OBB early-exit variance is
     /// eliminated from the benchmark signal.
@@ -368,7 +386,7 @@ impl BenchmarkState {
         println!("\n──────────────────────────────────────────");
         println!("  SCORE");
         println!("──────────────────────────────────────────");
-        println!("  Grade          : {}", score.grade());
+        println!("  Grade          : {}", score.grade(self.max_cubes));
         println!("  Total          : {}", score.total);
         println!(
             "  Clean passes   : {} cubes × {} pts = {}",
@@ -381,14 +399,14 @@ impl BenchmarkState {
             }
             Some((cube, BenchTrigger::Yellow)) => {
                 println!(
-                    "  Yellow trigger : {} cubes × {} pts = {}",
-                    cube, YELLOW_TRIGGER_MULTIPLIER, score.trigger_points
+                    "  Yellow trigger : {} cubes (penalty {} pts, capped)",
+                    cube, score.trigger_points
                 );
             }
             Some((cube, BenchTrigger::Red)) => {
                 println!(
-                    "  Red trigger    : {} cubes × {} pts = {}",
-                    cube, RED_TRIGGER_MULTIPLIER, score.trigger_points
+                    "  Red trigger    : {} cubes (penalty {} pts, capped)",
+                    cube, score.trigger_points
                 );
             }
         }
